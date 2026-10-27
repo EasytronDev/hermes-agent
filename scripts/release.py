@@ -613,6 +613,7 @@ def prune_old_canaries(args) -> None:
         date = _canary_date(tag)
         if date is not None and date < cutoff:
             doomed.append(tag)
+    _prune_old_commit_claims(args, push_remote)
     if not doomed:
         print("✓ No canaries older than 14 days.")
         return
@@ -635,6 +636,32 @@ def prune_old_canaries(args) -> None:
     if not args.publish:
         print("Dry run complete. No release was deleted.")
         print("Run the same command with --publish to delete the tags above.")
+
+
+def _prune_old_commit_claims(args, push_remote: str) -> None:
+    """Delete commit build claim tags older than 90 days (r2.COMMIT_KEEP_DAYS, the window their
+    claim archives keep). They own no GitHub release, so only the remote tag goes. Dated by the
+    tag's own UTC stamp; anything that does not parse is kept."""
+    from hermes_cli.update_channel import commit_timestamp
+    from scripts.releases.r2 import COMMIT_KEEP_DAYS
+
+    cutoff = (datetime.now(UTC) - timedelta(days=COMMIT_KEEP_DAYS)).strftime("%Y%m%d")
+    tags = git("tag", "--list", "commit.*", "--sort=-creatordate")
+    doomed = [tag for tag in (tags.split("\n") if tags else [])
+              if (stamp := commit_timestamp(tag)) is not None and stamp[:8] < cutoff]
+    if not doomed:
+        print(f"✓ No commit build claims older than {COMMIT_KEEP_DAYS} days.")
+        return
+    for tag in doomed:
+        if not args.publish:
+            print(f"Would delete {tag}")
+            continue
+        result = git_result("push", push_remote, "--delete", f"refs/tags/{tag}")
+        if result.returncode == 0:
+            git_result("tag", "-d", tag)
+            print(f"✓ Deleted {tag}")
+        else:
+            print(f"⚠ Could not delete {tag}: {result.stderr.strip()}")
 
 
 def main():
@@ -670,7 +697,8 @@ def main():
                         help="Clear an inherited variable at desktop launch, even when set. "
                              "Uses an explicit empty value; repeat for multiple variables.")
     parser.add_argument("--prune-canaries", action="store_true",
-                        help="Delete canary releases+tags older than 14 days")
+                        help="Delete canary releases+tags older than 14 days and commit build "
+                             "claim tags older than 90 days")
     parser.add_argument("--publish", action="store_true",
                         help="Actually create the tag and GitHub release (otherwise dry run)")
     parser.add_argument("--remote", type=str,
