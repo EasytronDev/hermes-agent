@@ -19,6 +19,7 @@ export function isCanaryTag(tag: string | null | undefined): boolean {
  * Never strip a leading `v`: canary and commit tags start with their kind. */
 export function releaseTagVersion(tag: string | null | undefined): string | null {
   const match = /^(?:(canary|commit)\.(20\d{6}T\d{6}Z)-)?v(\d+\.\d+\.\d+)$/.exec(tag || '')
+
   if (!match) {
     return null
   }
