@@ -646,20 +646,23 @@ def main():
                              "--only/--with/--without (starting from every lane but upgrade) "
                              "and --require-green/--no-require-green")
     parser.add_argument("--only", action="append", metavar="LANES",
-                        help="--canary: start from exactly these lanes (comma-separated, repeatable)")
+                        help="--canary/--build-commit: start from exactly these lanes (comma-separated, repeatable)")
     parser.add_argument("--with", dest="with_lanes", action="append", metavar="LANES",
-                        help="--canary: also build or test these lanes")
+                        help="--canary/--build-commit: also build or test these lanes")
     parser.add_argument("--without", dest="without_lanes", action="append", metavar="LANES",
-                        help="--canary: do not build or test these lanes")
+                        help="--canary/--build-commit: do not build or test these lanes")
     parser.add_argument("--require-green", action=argparse.BooleanOptionalAction, default=True,
                         help="Hold publication until every suite passes (default). "
                              "--no-require-green publishes once the candidate is built and smoked "
                              "and lets the suites report; stable releases always require green")
     parser.add_argument("--build-commit", type=str, metavar="REV",
-                        help="Preview an exact-commit build into releases/commit/<sha>/ on R2. "
-                             "Add --publish to dispatch without a tag or release. The same "
-                             "direct dispatch runs from any GitHub remote; add --channel NAME "
-                             "to publish into an updatable R2 channel instead of a one-off.")
+                        help="Build an exact pushed commit through the Stable Release pipeline: "
+                             "claims commit.<YYYYMMDDTHHMMSSZ>-v<version> on REV and dispatches it "
+                             "(add --publish; otherwise a dry run that creates nothing). It publishes "
+                             "nowhere; its builds page is releases/tag/<claim>/index.html. Takes "
+                             "--only/--with/--without (starting from the stable default minus "
+                             "upgrade, install-e2e and windows-store) and --[no-]require-green. Add "
+                             "--channel NAME to publish into an updatable R2 channel instead.")
     parser.add_argument("--bundle-env", action="append", default=[], metavar="NAME=VALUE",
                         help="Bake a non-secret environment default into a commit desktop bundle. "
                              "Repeat for multiple variables. Runtime environment values win.")
@@ -733,9 +736,13 @@ def main():
             parser.error("stable releases always require green; --no-require-green is for --canary")
         stable_commands[args.command](args)
         return
-    if not args.canary and (args.only or args.with_lanes or args.without_lanes or not args.require_green):
-        parser.error("--only/--with/--without/--no-require-green need --canary or the release command")
+    if not (args.canary or args.build_commit is not None) and (
+            args.only or args.with_lanes or args.without_lanes or not args.require_green):
+        parser.error("--only/--with/--without/--no-require-green need --canary, --build-commit "
+                     "or the release command")
     if validate_arguments(parser, args):
+        if args.only or args.with_lanes or args.without_lanes or not args.require_green:
+            parser.error("channel builds do not take --only/--with/--without/--no-require-green yet")
         cmd_channel(args)
         return
     if (args.bundle_env or args.bundle_unset) and args.build_commit is None:

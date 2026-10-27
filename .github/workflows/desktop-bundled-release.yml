@@ -2373,24 +2373,8 @@ jobs:
             --summary-commit "$RELEASE_COMMIT" --repo "$GITHUB_REPOSITORY" \
             --summary-out "$GITHUB_STEP_SUMMARY" \
             --summary-failed-legs "$failed" --run-url "$RUN_URL"
-      - name: Return to the trusted receipt controller
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          filter: blob:none
-      - name: Publish the post-build commit receipt
-        env:
-          BUILD_COMMIT: ${{ needs.validate.outputs.sha }}
-          TAG: ''
-          RELEASE_PHASE: ''
-          UPLOAD_RELEASE: 'false'
-          TERMUX_UPGRADE_FROM_TAG: ''
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          BUNDLE_ENV_JSON: ${{ inputs.bundle_env }}
-          RELEASE_NEEDS: ${{ toJSON(needs) }}
-          GH_TOKEN: ${{ github.token }}
-        run: python -m scripts.releases.commit_build receipt
+      # No post-build receipt tag: a commit build's identity is its claim tag
+      # (commit.<stamp>-vX.Y.Z), minted before the build by release.py --build-commit.
 
   stable-publish:
     name: Verify published candidate files
