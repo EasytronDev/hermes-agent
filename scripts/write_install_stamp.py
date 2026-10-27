@@ -164,7 +164,10 @@ def build_stamp(
         from scripts.releases.commit_build import require_commit
 
         require_commit(commit_build)
-        if os.environ.get("HERMES_PAYLOAD_TAG"):
+        # A commit build may carry only its own claim tag (commit.<stamp>-vX.Y.Z): the stamp still
+        # says source commit-build, so every updater refuses it.
+        payload_tag = os.environ.get("HERMES_PAYLOAD_TAG")
+        if payload_tag and not update_channel.is_commit_tag(payload_tag):
             raise ValueError("Commit builds cannot also select a release tag")
         if _resolve_commit_from_git() != commit_build or commit not in (None, commit_build):
             raise ValueError("Commit build identity does not match the checkout HEAD")
@@ -243,6 +246,8 @@ def build_stamp(
     tag = os.environ.get("HERMES_PAYLOAD_TAG") or None
 
     _stable_tag = re.compile(r"^v(0|[1-9]\d{0,2})\.\d+\.\d+$")
+    if tag and update_channel.is_commit_tag(tag) and not commit_build:
+        raise ValueError("A commit build tag requires HERMES_BUILD_COMMIT (the commit identity)")
     if payload != "bootstrap" and not commit_build and channel_request is None and not (
         tag and (_stable_tag.match(tag) or update_channel.is_canary_tag(tag))
     ):
