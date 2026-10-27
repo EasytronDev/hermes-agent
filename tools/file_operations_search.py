@@ -306,7 +306,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                     pass
         return SearchResult(
             counts=counts, total_count=sum(counts.values()),
-            truncated=bool(limit_reason), limit_reason=limit_reason)
+            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning)
     matches = []
     for line in lines:
         if line == "--":

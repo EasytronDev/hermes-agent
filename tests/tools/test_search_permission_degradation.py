@@ -263,6 +263,38 @@ def test_content_search_with_unreadable_dir_returns_partial_matches():
     assert "/srv/locked" in (result.warning or "")
 
 
+class CountEnvironment(RecordingEnvironment):
+    """rg lane where ``--count-matches`` returns the canned output."""
+
+    def execute(self, command, **kwargs):
+        if "--count-matches" in command:
+            self.commands.append(command)
+            return {"output": self.rg_output, "returncode": self.rg_code}
+        return super().execute(command, **kwargs)
+
+
+def test_count_search_with_unreadable_dir_keeps_partial_warning():
+    env = CountEnvironment(rg_output=EACCES_DIR + "/repo/a.py:2\n", rg_code=2)
+
+    result = ShellFileOperations(env).search(
+        "needle", path="/repo", target="content", output_mode="count")
+
+    assert result.error is None
+    assert result.counts == {"/repo/a.py": 2}
+    assert "unreadable path" in (result.warning or "")
+    assert "/srv/locked" in (result.warning or "")
+
+
+def test_count_search_clean_has_no_warning():
+    env = CountEnvironment(rg_output="/repo/a.py:2\n", rg_code=0)
+
+    result = ShellFileOperations(env).search(
+        "needle", path="/repo", target="content", output_mode="count")
+
+    assert result.counts == {"/repo/a.py": 2}
+    assert result.warning is None
+
+
 def test_content_search_fully_unreadable_degrades_to_actionable_empty():
     env = RecordingEnvironment(rg_output=EACCES_DIR, rg_code=2)
 
