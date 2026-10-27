@@ -542,10 +542,11 @@ def main(argv: list | None = None) -> int:
     # hermes-nightly is the suite actually published today
     # (https://hermes-assets.nousresearch.com/releases/termux/nightly/,
     # verified 2026-09-06); hermes-stable/hermes-canary are what CI stages
-    # for the stable/canary channels.
+    # for the stable/canary channels; hermes-commit is a commit build's suite,
+    # staged only in its claim archive and never published to a feed.
     ap.add_argument(
         "--suite", required=True,
-        choices=["hermes-stable", "hermes-canary", "hermes-nightly"],
+        choices=["hermes-stable", "hermes-canary", "hermes-commit", "hermes-nightly"],
     )
     ap.add_argument("--gpg-key-file", type=Path, default=None)
     ap.add_argument("--pool-subdir", default="")
