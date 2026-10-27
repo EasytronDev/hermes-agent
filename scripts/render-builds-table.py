@@ -402,7 +402,10 @@ def render_page(tag: str, assets_by_app: dict, base_url: str,
                 run_url: str | None = None, *, repo: str = DEFAULT_REPO,
                 smoke_results: dict | None = None) -> str:
     """The tag/channel page: the release-body download table as HTML."""
-    channel = r2.channel_for_tag(tag)
+    from hermes_cli.update_channel import is_commit_tag
+
+    # A commit build publishes to no channel: its page lives only in its claim archive.
+    channel = "commit" if is_commit_tag(tag) else r2.channel_for_tag(tag)
     tag_url = f"https://github.com/{quote(repo, safe='/')}/releases/tag/{quote(tag, safe='')}"
     body = [
         f"<h1>Hermes Desktop {channel} builds</h1>",
@@ -724,6 +727,21 @@ def main() -> int:
             write_page(r2.staging_key_for(archive, "index.html"),
                        render_page(archive, assets, args.r2_base_url, incomplete, args.run_url,
                                    repo=args.repo, smoke_results=smoke_results), args.r2_base_url)
+
+    from hermes_cli.update_channel import is_commit_tag
+
+    if is_commit_tag(args.tag):
+        # A commit build owns no GitHub release and no channel page: its claim archive's page
+        # (written above) and the run summary are its whole publication.
+        if args.pending_run_url:
+            parser.error("A commit build has no release body to hold a builds-in-progress link")
+        if args.summary_out:
+            with open(args.summary_out, "a", encoding="utf-8") as out:
+                out.write(f"## Commit build {args.tag}\n\n"
+                          f"Builds page: {r2.public_url_for(args.r2_base_url, r2.staging_key_for(archive, 'index.html'))}\n\n"
+                          + block)
+        print(f"✓ Commit build page rendered for {args.tag} ({len(names)} assets scanned)")
+        return 0
 
     # Keep the per-tag diagnostic page even when GitHub cannot supply a draft.
     view = subprocess.run(

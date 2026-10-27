@@ -110,6 +110,10 @@ on:
         description: 'Stable candidates only: build and stage without native smokes or in-build test suites (the claim has no smoke lane).'
         type: boolean
         default: false
+      bundle_env:
+        description: "A commit claim's baked bundle defaults (its claim bundleEnv); validate refuses anything else."
+        type: string
+        default: '{}'
       skip-signed:
         description: 'Stable candidates only: build no signed Windows package (the claim has no windows lane). Needs no Azure signing.'
         type: boolean
@@ -390,7 +394,9 @@ jobs:
             python -m scripts.releases.commit_build admit
             exit 0
           fi
-          if [ -n "${BUNDLE_ENV_JSON:-}" ] && [ "$BUNDLE_ENV_JSON" != '{}' ]; then
+          # A commit claim's bundle defaults arrive in the candidate phase, where `stable verify`
+          # requires them to equal its claim's bundleEnv; nothing else may carry them.
+          if [ -n "${BUNDLE_ENV_JSON:-}" ] && [ "$BUNDLE_ENV_JSON" != '{}' ] && [ "$RELEASE_PHASE" != candidate ]; then
             echo '::error::bundle environment defaults require a commit build'; exit 1
           fi
           if [ -z "$TAG" ]; then
@@ -441,7 +447,9 @@ jobs:
       RELEASE_CLAIM_TAG: ${{ inputs.claim-tag }}
       # Archive ref for handoff stage/fetch: attempt ref for stable phases.
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
-      HERMES_BUILD_COMMIT: ${{ inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha || '' }}
+      # The commit identity: a tagless commit build's, or a commit claim's in the candidate phase
+      # (commit.<stamp>-vX.Y.Z keeps the Commit<sha7> identity; its tag still versions the packages).
+      HERMES_BUILD_COMMIT: ${{ (inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha) || (inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.') && needs.validate.outputs.sha) || '' }}
       HERMES_RELEASE_COMMIT: ${{ inputs.release-phase != '' && needs.validate.outputs.sha || '' }}
       HERMES_PAYLOAD_VERSION: ${{ needs.validate.outputs.payload-version }}
       # Signature outputs are separate from the prepared dependency snapshot.
@@ -515,7 +523,7 @@ jobs:
           HERMES_BUNDLE_ENV_JSON: ${{ inputs.bundle_env }}
         run: |
           args=(--tag "$HERMES_PAYLOAD_TAG")
-          if [ -n "$HERMES_BUILD_COMMIT" ]; then args=(--commit "$HERMES_BUILD_COMMIT"); fi
+          if [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then args=(--commit "$HERMES_BUILD_COMMIT"); fi
           if [ -n "$HERMES_RELEASE_COMMIT" ]; then args+=(--release-commit "$HERMES_RELEASE_COMMIT"); fi
           if [ -n "${CHANNEL_BUILD:-}" ]; then args=(--channel-request "$RUNNER_TEMP/channel-request.json"); fi
           python scripts/bundles/desktop.py "${args[@]}" --variant bundled --prepare-only \
@@ -700,7 +708,7 @@ jobs:
               --out "apps/desktop/release/metadata-windows-${TARGET##*-}.json"
             args+=(--include 'metadata-*.json')
           fi
-          if [ -n "$HERMES_BUILD_COMMIT" ]; then
+          if [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then
             # Commit-only mode: schema-2 receipts under releases/commit/<sha>/.
             python -m scripts.releases.handoff stage --commit-build "$HERMES_BUILD_COMMIT" \
               --commit "$RELEASE_COMMIT" \
@@ -844,7 +852,9 @@ jobs:
       RELEASE_CLAIM_TAG: ${{ inputs.claim-tag }}
       # Archive ref for handoff stage/fetch: attempt ref for stable phases.
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
-      HERMES_BUILD_COMMIT: ${{ inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha || '' }}
+      # The commit identity: a tagless commit build's, or a commit claim's in the candidate phase
+      # (commit.<stamp>-vX.Y.Z keeps the Commit<sha7> identity; its tag still versions the packages).
+      HERMES_BUILD_COMMIT: ${{ (inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha) || (inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.') && needs.validate.outputs.sha) || '' }}
       HERMES_RELEASE_COMMIT: ${{ inputs.release-phase != '' && needs.validate.outputs.sha || '' }}
       HERMES_PAYLOAD_VERSION: ${{ needs.validate.outputs.payload-version }}
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
@@ -903,7 +913,7 @@ jobs:
           HERMES_BUNDLE_ENV_JSON: ${{ inputs.bundle_env }}
         run: |
           args=(--tag "$HERMES_PAYLOAD_TAG")
-          if [ -n "$HERMES_BUILD_COMMIT" ]; then args=(--commit "$HERMES_BUILD_COMMIT"); fi
+          if [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then args=(--commit "$HERMES_BUILD_COMMIT"); fi
           if [ -n "$HERMES_RELEASE_COMMIT" ]; then args+=(--release-commit "$HERMES_RELEASE_COMMIT"); fi
           if [ -n "${CHANNEL_BUILD:-}" ]; then args=(--channel-request "$RUNNER_TEMP/channel-request.json"); fi
           python3 scripts/bundles/desktop.py "${args[@]}" --variant bundled --prepare-only \
@@ -1052,7 +1062,8 @@ jobs:
           key: mac-signatures-v1-${{ matrix.target.label }}-${{ hashFiles('.cache/mac-payload-signatures/**') }}
 
       - name: Rename the feed yml per arch
-        if: inputs.upload_release == true || inputs.release-phase == 'candidate'
+        # A commit build has no feed (product identity channel null), so there is no yml to rename.
+        if: (inputs.upload_release == true || inputs.release-phase == 'candidate') && !startsWith(inputs.tag, 'commit.')
         # electron-builder writes the channel feed yml (stable-mac.yml /
         # canary-mac.yml) with the SAME name on both legs; prefix the arch
         # so the R2 tag archive keeps both and finalize can merge them
@@ -1108,7 +1119,7 @@ jobs:
               --out "apps/desktop/release/metadata-macos-${TARGET##*-}.json"
             args+=(--include 'metadata-*.json')
           fi
-          if [ -n "$HERMES_BUILD_COMMIT" ]; then
+          if [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then
             # Commit-only mode: binaries only — no feed yml exists without a tag.
             python -m scripts.releases.handoff stage --commit-build "$HERMES_BUILD_COMMIT" \
               --commit "$RELEASE_COMMIT" \
@@ -1468,7 +1479,9 @@ jobs:
       HERMES_PAYLOAD_TAG: ${{ inputs.tag }}
       # Archive ref for the universal-bundle handoff: attempt ref for stable.
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
-      HERMES_BUILD_COMMIT: ${{ inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha || '' }}
+      # The commit identity: a tagless commit build's, or a commit claim's in the candidate phase
+      # (commit.<stamp>-vX.Y.Z keeps the Commit<sha7> identity; its tag still versions the packages).
+      HERMES_BUILD_COMMIT: ${{ (inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha) || (inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.') && needs.validate.outputs.sha) || '' }}
       HERMES_PAYLOAD_VERSION: ${{ needs.validate.outputs.payload-version }}
       # The paths build-win32-x64 saves its bundle-assembly caches from.
       ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/desktop-inputs/packager/builder
@@ -1539,7 +1552,7 @@ jobs:
           if [ -n "${CHANNEL_BUILD:-}" ]; then
             python -m scripts.releases.handoff fetch --channel-request "$RUNNER_TEMP/channel-request.json" \
               --name win32-x64 --name win32-arm64 --root apps/desktop/release --include '*.msix'
-          elif [ -n "$HERMES_BUILD_COMMIT" ]; then
+          elif [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then
             python -m scripts.releases.handoff fetch --commit-build "$HERMES_BUILD_COMMIT" \
               --commit "$RELEASE_COMMIT" \
               --name win32-x64 --name win32-arm64 --root apps/desktop/release --include '*.msix'
@@ -1586,7 +1599,7 @@ jobs:
             node scripts/stage-msixbundle.mjs --channel-request "$RUNNER_TEMP/channel-request.json" --variant bundled
             exit 0
           fi
-          if [ -n "$HERMES_BUILD_COMMIT" ]; then
+          if [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then
             node scripts/stage-msixbundle.mjs --commit "$HERMES_BUILD_COMMIT" --version "$HERMES_PAYLOAD_VERSION" --variant bundled --no-upload
             exit 0
           fi
@@ -1607,7 +1620,7 @@ jobs:
           if [ -n "${CHANNEL_BUILD:-}" ]; then
             python -m scripts.releases.handoff stage --channel-request "$RUNNER_TEMP/channel-request.json" \
               --name windows-universal --root apps/desktop/release --include '*.msixbundle'
-          elif [ -n "$HERMES_BUILD_COMMIT" ]; then
+          elif [ -n "$HERMES_BUILD_COMMIT" ] && [ -z "$HERMES_PAYLOAD_TAG" ]; then
             python -m scripts.releases.handoff stage --commit-build "$HERMES_BUILD_COMMIT" \
               --commit "$RELEASE_COMMIT" \
               --name windows-universal --root apps/desktop/release --include '*.msixbundle'
@@ -1851,7 +1864,9 @@ jobs:
       HERMES_PAYLOAD_TAG: ${{ inputs.tag }}
       # Archive ref for the termux handoff: attempt ref for stable phases.
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
-      HERMES_BUILD_COMMIT: ${{ inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha || '' }}
+      # The commit identity: a tagless commit build's, or a commit claim's in the candidate phase
+      # (commit.<stamp>-vX.Y.Z keeps the Commit<sha7> identity; its tag still versions the packages).
+      HERMES_BUILD_COMMIT: ${{ (inputs.build_commit != '' && needs.validate.outputs.channel-build == '' && needs.validate.outputs.sha) || (inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.') && needs.validate.outputs.sha) || '' }}
       HERMES_RELEASE_COMMIT: ${{ inputs.release-phase != '' && needs.validate.outputs.sha || '' }}
       # termux_build.sh gates on `gh release view <tag>` (refuse to build
       # before the release exists); gh needs GH_TOKEN or it errors out and
@@ -2412,7 +2427,7 @@ jobs:
     # leaves a held submission no customer sees, never a live build.
     needs: [validate]
     # Never a canary: a canary builds and stages its Store bundle but only stable submits one.
-    if: inputs.release-phase == 'publish' && inputs.skip-store != true && !startsWith(inputs.tag, 'canary.')
+    if: inputs.release-phase == 'publish' && inputs.skip-store != true && !startsWith(inputs.tag, 'canary.') && !startsWith(inputs.tag, 'commit.')
     # The Store is not a release gate: a failed submission leaves the release publishable
     # and the summary names the Store package for a manual Partner Center upload.
     continue-on-error: true
