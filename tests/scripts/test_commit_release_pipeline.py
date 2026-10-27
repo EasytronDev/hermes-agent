@@ -282,10 +282,18 @@ def test_the_builds_page_of_a_commit_build_touches_no_release_or_channel(monkeyp
     summary = tmp_path / "summary.md"
     monkeypatch.setattr(sys, "argv", ["render-builds-table.py", "--tag", TAG, "--archive", TAG, "--repo", "o/r",
                                       "--r2-base-url", "https://releases.example", "--candidate-manifest-sha256",
-                                      "f" * 64, "--candidate-commit", COMMIT, "--summary-out", str(summary)])
+                                      "f" * 64, "--candidate-commit", COMMIT, "--summary-out", str(summary),
+                                      "--bundle-env-json", '{"HERMES_HOME": null}'])
     assert rbt.main() == 0
     assert list(written) == [f"releases/tag/{TAG}/index.html"]
-    assert "commit builds" in written[f"releases/tag/{TAG}/index.html"]
+    page = written[f"releases/tag/{TAG}/index.html"]
+    # It links its source commit, not a GitHub release it does not have, and lists its defaults.
+    assert f"https://github.com/o/r/commit/{COMMIT}" in page and "/releases/tag/" not in page.split("<h2>")[0]
+    assert "<code>HERMES_HOME</code>" in page and "Unset" in page
+    with pytest.raises(ValueError, match="exact source commit"):
+        rbt.render_page(TAG, {}, "https://releases.example")
+    with pytest.raises(ValueError, match="Only a commit build page"):
+        rbt.render_page("v1.2.3", {}, "https://releases.example", bundle_env={"HERMES_HOME": None})
     text = summary.read_text(encoding="utf-8")
     assert f"Commit build {TAG}" in text and f"releases/tag/{TAG}/index.html" in text
 

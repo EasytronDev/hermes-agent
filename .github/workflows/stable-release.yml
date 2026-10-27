@@ -718,6 +718,9 @@ jobs:
       RELEASE_CLAIM_TAG: ${{ needs.admit.outputs.claim-tag }}
       RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
       CANDIDATE_MANIFEST_SHA256: ${{ needs.candidate-manifest.outputs.manifest-sha256 }}
+      # The admitted claim's bundle defaults, listed on the page (stable verify bound every
+      # candidate leg's bundle env to the same claim).
+      CLAIM_BUNDLE_ENV: ${{ needs.admit.outputs.bundle-env }}
       CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
       CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
       CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
@@ -735,7 +738,7 @@ jobs:
           python scripts/render-builds-table.py --tag "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --archive "$RELEASE_CLAIM_TAG" --r2-base-url "$CLOUDFLARE_R2_PUBLIC_URL" \
             --candidate-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" --candidate-commit "$RELEASE_COMMIT" \
-            --summary-out "$GITHUB_STEP_SUMMARY"
+            --bundle-env-json "$CLAIM_BUNDLE_ENV" --summary-out "$GITHUB_STEP_SUMMARY"
 
   publication:
     name: All artifact publication succeeded

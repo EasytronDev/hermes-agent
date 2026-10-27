@@ -234,8 +234,10 @@ def test_a_commit_build_runs_the_default_jobs_but_upgrade_tests_and_publishes_no
     # Its page is rendered from the pinned accepted candidate into its own claim archive only.
     render = next(step for step in publish["steps"] if "render-builds-table.py" in step.get("run", ""))
     for flag in ('--archive "$RELEASE_CLAIM_TAG"', '--candidate-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256"',
-                 '--candidate-commit "$RELEASE_COMMIT"', '--summary-out "$GITHUB_STEP_SUMMARY"'):
+                 '--candidate-commit "$RELEASE_COMMIT"', '--bundle-env-json "$CLAIM_BUNDLE_ENV"',
+                 '--summary-out "$GITHUB_STEP_SUMMARY"'):
         assert flag in render["run"], flag
+    assert publish["env"]["CLAIM_BUNDLE_ENV"] == "${{ needs.admit.outputs.bundle-env }}"
     complete_render = next(step for step in jobs["complete"]["steps"]
                            if step.get("name") == "Render the admitted candidate smoke results")
     assert not gate(complete_render["if"], {}, {"admit": {"result": "success", "outputs": {

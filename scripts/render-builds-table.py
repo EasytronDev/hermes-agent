@@ -397,21 +397,53 @@ def _link(url: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">'
 
 
+def _bundle_env_html(bundle_env: dict[str, str | None] | None) -> list[str]:
+    """The explicit bundle defaults a commit build baked in, or nothing when there were none."""
+    if not bundle_env:
+        return []
+    from scripts.releases.bundle_env import validate
+
+    return [
+        "<h2>Bundle environment</h2>",
+        "<p>Explicit non-secret desktop bundle overrides only. Runtime values override defaults; "
+        "Unset always removes the variable. String values use JSON notation.</p>",
+        *_table(("Variable", "Value / action"), [
+            [f"<code>{html.escape(key)}</code>", "Unset" if value is None else
+             f"<code>{html.escape(json.dumps(value, ensure_ascii=False))}</code>"]
+            for key, value in sorted(validate(bundle_env).items())
+        ]),
+    ]
+
+
 def render_page(tag: str, assets_by_app: dict, base_url: str,
                 incomplete_jobs: list[str] | None = None,
                 run_url: str | None = None, *, repo: str = DEFAULT_REPO,
-                smoke_results: dict | None = None) -> str:
+                smoke_results: dict | None = None, commit: str | None = None,
+                bundle_env: dict[str, str | None] | None = None) -> str:
     """The tag/channel page: the release-body download table as HTML."""
     from hermes_cli.update_channel import is_commit_tag
 
-    # A commit build publishes to no channel: its page lives only in its claim archive.
-    channel = "commit" if is_commit_tag(tag) else r2.channel_for_tag(tag)
-    tag_url = f"https://github.com/{quote(repo, safe='/')}/releases/tag/{quote(tag, safe='')}"
-    body = [
-        f"<h1>Hermes Desktop {channel} builds</h1>",
-        f"<p>Release {_link(tag_url)}<code>{html.escape(tag)}</code></a>. Only objects this release "
-        "actually staged in the bucket are listed.</p>",
-    ]
+    if is_commit_tag(tag):
+        # A commit build publishes to no channel and owns no GitHub release: its page lives only
+        # in its claim archive and links its source commit.
+        if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("A commit build page needs its exact source commit")
+        commit_url = f"https://github.com/{quote(repo, safe='/')}/commit/{commit}"
+        body = [
+            "<h1>Hermes Desktop commit build</h1>",
+            f"<p>Commit build <code>{html.escape(tag)}</code> of {_link(commit_url)}<code>{commit}</code></a>. "
+            "It updates nothing: no release, channel, feed or Store listing. Only objects this build "
+            "actually staged in the bucket are listed.</p>",
+        ]
+    else:
+        if bundle_env:
+            raise ValueError("Only a commit build page lists bundle defaults")
+        tag_url = f"https://github.com/{quote(repo, safe='/')}/releases/tag/{quote(tag, safe='')}"
+        body = [
+            f"<h1>Hermes Desktop {r2.channel_for_tag(tag)} builds</h1>",
+            f"<p>Release {_link(tag_url)}<code>{html.escape(tag)}</code></a>. Only objects this release "
+            "actually staged in the bucket are listed.</p>",
+        ]
     attempt = versioning.parse_attempt_ref(tag)
     if attempt is not None:
         version = attempt[0]
@@ -441,7 +473,9 @@ def render_page(tag: str, assets_by_app: dict, base_url: str,
             [[html.escape(job), f"{_link(run_url)}View build run</a>"] for job in incomplete_jobs],
         ))
     body.extend(smoke_html(smoke_results))
-    return _page(f"Hermes Desktop {channel} builds", tag, body)
+    body.extend(_bundle_env_html(bundle_env))
+    title = "Hermes Desktop commit build" if is_commit_tag(tag) else f"Hermes Desktop {r2.channel_for_tag(tag)} builds"
+    return _page(title, tag, body)
 
 
 def render_commit_page(commit: str, names: list[str], base_url: str,
@@ -462,20 +496,8 @@ def render_commit_page(commit: str, names: list[str], base_url: str,
         f"<p>Commit {_link(commit_url)}<code>{html.escape(commit)}</code></a>. Every expected binary is listed; "
         "built rows link to downloads; incomplete rows link to the build run when available.</p>",
         *_table(("Binary", "Status", "Download / diagnostics"), rows),
+        *_bundle_env_html(bundle_env),
     ]
-    if bundle_env:
-        from scripts.releases.bundle_env import validate
-
-        body.extend([
-            "<h2>Bundle environment</h2>",
-            "<p>Explicit non-secret desktop bundle overrides only. Runtime values override defaults; "
-            "Unset always removes the variable. String values use JSON notation.</p>",
-            *_table(("Variable", "Value / action"), [
-                [f"<code>{html.escape(key)}</code>", "Unset" if value is None else
-                 f"<code>{html.escape(json.dumps(value, ensure_ascii=False))}</code>"]
-                for key, value in sorted(validate(bundle_env).items())
-            ]),
-        ])
     body.extend(smoke_html(smoke_results))
     return _page(f"Hermes commit build {commit[:12]}", commit, body)
 
@@ -724,9 +746,16 @@ def main() -> int:
         # A failed run still owns its tag page, never the channel pointer
         # consumed by source updates. Missing artifacts never become downloads.
         if not args.dry_run:
+            from hermes_cli.update_channel import is_commit_tag
+            from scripts.releases.bundle_env import decode
+
+            commit_page = is_commit_tag(archive)
             write_page(r2.staging_key_for(archive, "index.html"),
                        render_page(archive, assets, args.r2_base_url, incomplete, args.run_url,
-                                   repo=args.repo, smoke_results=smoke_results), args.r2_base_url)
+                                   repo=args.repo, smoke_results=smoke_results,
+                                   commit=args.candidate_commit if commit_page else None,
+                                   bundle_env=decode(args.bundle_env_json) if commit_page else None),
+                       args.r2_base_url)
 
     from hermes_cli.update_channel import is_commit_tag
 
