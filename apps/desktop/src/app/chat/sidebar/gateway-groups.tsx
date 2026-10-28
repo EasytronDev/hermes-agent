@@ -31,6 +31,7 @@ import { $sessionProfilesUsage } from '@/store/session'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
 import { SidebarGroupRow, SidebarRowGrab, SidebarRowLink, SidebarRowStack } from './chrome'
+import { gatewayLabel } from './gateway-group-model'
 import {
   $gatewayGroupAliases,
   $gatewayGroupCollapsed,
@@ -64,6 +65,7 @@ export function GatewayProfileGroups({
   nested = false,
   embedded = false
 }: GatewayProfileGroupsProps) {
+  const { t } = useI18n()
   const registry = useStore($connectionsRegistry)
   const order = useStore($gatewayGroupOrder)
   const gatewayProfiles = new Map<string, SidebarSessionGroup[]>()
@@ -87,8 +89,7 @@ export function GatewayProfileGroups({
       sections.push({
         id,
         connectionId: group.connectionId,
-        label:
-          registry?.connections.find(connection => connection.id === group.connectionId)?.label || group.connectionId,
+        label: gatewayLabel(group.connectionId, registry, t.settings.gateway.webappHostTitle),
         mode: 'profile',
         path: null,
         sessions: []

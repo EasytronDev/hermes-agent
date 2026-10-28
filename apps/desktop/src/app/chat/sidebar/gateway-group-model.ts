@@ -1,3 +1,4 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useMemo } from 'react'
 
@@ -8,6 +9,18 @@ import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { $profileColors, normalizeProfileKey } from '@/store/profile'
 
 import type { SidebarSessionGroup } from './projects/workspace-groups'
+
+/** A gateway section's name: its registry label, else `localLabel` for the `local` source a
+ *  registry does not list (the Webapp's one gateway, the host serving it), else the raw id. */
+export function gatewayLabel(
+  connectionId: string,
+  registry: DesktopConnectionsRegistry | null,
+  localLabel: string
+): string {
+  const registered = registry?.connections.find(connection => connection.id === connectionId)?.label
+
+  return registered || (connectionId === LOCAL_CONNECTION_ID ? localLabel : connectionId)
+}
 
 /** One group per exact owner `[connectionId, profile]`. Group identity never
  *  depends on a mutable label, URL, or the active gateway. */
