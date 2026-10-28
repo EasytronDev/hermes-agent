@@ -17,7 +17,7 @@ import pytest
 
 from scripts.releases import lanes as lane_set
 from scripts.releases import stable
-from tests.scripts.test_release_tags import release_repo  # noqa: F401  (fixture)
+from tests.scripts.test_release_tags import release_repo  # (a fixture)
 
 STAMP = "20261026T180000Z"
 TAG = f"commit.{STAMP}-v1.2.3"
@@ -307,14 +307,14 @@ def build_args(**options):
 
 
 @pytest.fixture
-def commit_repo(tmp_path, monkeypatch, release_repo):
+def commit_repo(tmp_path, monkeypatch, request):
     """A real repository and bare remote; GitHub (gh) is an inert recorder."""
     import subprocess
 
     from scripts import release
     from scripts.releases import commit_build
 
-    git = release_repo
+    git = request.getfixturevalue("release_repo")
     # tests.scripts.test_release_tags patches its own import of release.py; commit_build uses this one.
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "hermes-agent"\nversion = "1.2.3"\n',
@@ -343,7 +343,7 @@ def commit_repo(tmp_path, monkeypatch, release_repo):
     # here the revision resolves to the checkout's HEAD.
     monkeypatch.setattr(commit_build, "resolve_revision", lambda rev, remote_name, repo: git("rev-parse", rev))
     monkeypatch.setenv("CLOUDFLARE_R2_PUBLIC_URL", "https://releases.example")
-    remote_git = lambda *args: actual_run(["git", "--git-dir", str(remote), *args], capture_output=True,  # noqa: E731
+    remote_git = lambda *args: actual_run(["git", "--git-dir", str(remote), *args], capture_output=True,
                                            text=True, encoding="utf-8", check=True).stdout.strip()
     return git, remote_git, calls
 
@@ -385,7 +385,7 @@ def test_build_commit_claims_the_commit_and_runs_stable_release_on_it(commit_rep
 def test_build_commit_refuses_a_lane_a_commit_build_cannot_run(commit_repo):
     from scripts.releases.commit_build import cmd_build_commit
 
-    git, remote_git, calls = commit_repo
+    git, _remote_git, calls = commit_repo
     for lane in ("upgrade", "install-e2e", "windows-store"):
         with pytest.raises(SystemExit, match="commit claim cannot run"):
             cmd_build_commit(build_args(with_lanes=[lane]))

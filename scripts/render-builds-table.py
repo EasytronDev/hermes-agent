@@ -617,6 +617,67 @@ def render_channel_summary(manifest: dict) -> str:
             "| Native package | Version | Download |\n|---|---|---|\n" + "\n".join(rows) + "\n")
 
 
+def _render_commit_summary(args, smoke_results: dict) -> int:
+    """--summary-commit: the legacy tagless commit build's summary and releases/commit/<sha>/ page."""
+    if not args.summary_out:
+        print("::error::--summary-out is required with --summary-commit")
+        return 1
+    if not args.r2_base_url:
+        print("::error::--r2-base-url (or CLOUDFLARE_R2_PUBLIC_URL) is required to render the summary")
+        return 1
+    commit = args.summary_commit
+    try:
+        from scripts.releases.bundle_env import decode
+
+        bundle_env = decode(args.bundle_env_json)
+        prefix = r2.commit_prefix_for(commit)
+    except ValueError as err:
+        print(f"::error::{err}")
+        return 1
+    names = r2_object_names_under(prefix)
+    receipts = read_commit_receipts(commit)
+    failed_legs = (failed_legs_from_release_needs(os.environ.get("RELEASE_NEEDS"))
+                   or [leg.strip() for leg in args.summary_failed_legs.split(",") if leg.strip()])
+    block = render_commit_summary(names, args.r2_base_url, commit, receipts, failed_legs, args.run_url,
+                                  smoke_results=smoke_results)
+    with open(args.summary_out, "a", encoding="utf-8") as out:
+        out.write(block)
+    write_page(r2.commit_page_key_for(commit),
+               render_commit_page(commit, names, args.r2_base_url, receipts, failed_legs, args.run_url,
+                                  repo=args.repo, bundle_env=bundle_env, smoke_results=smoke_results),
+               args.r2_base_url)
+    built = sum(1 for row in commit_expected_rows(names, receipts) if row["state"] == "built")
+    print(f"✓ Commit summary appended to {args.summary_out} ({built}/{len(_COMMIT_EXPECTED)} binaries built)")
+    return 0
+
+
+def _write_tag_page(args, archive: str, assets: dict, incomplete: list[str], smoke_results: dict) -> None:
+    """The archive's own page. A commit build's page links its commit and lists its bundle defaults."""
+    from hermes_cli.update_channel import is_commit_tag
+    from scripts.releases.bundle_env import decode
+
+    extra = ({"commit": args.candidate_commit, "bundle_env": decode(args.bundle_env_json)}
+             if is_commit_tag(archive) else {})
+    write_page(r2.staging_key_for(archive, "index.html"),
+               render_page(archive, assets, args.r2_base_url, incomplete, args.run_url,
+                           repo=args.repo, smoke_results=smoke_results, **extra),
+               args.r2_base_url)
+
+
+def _finish_commit_build(args, parser, archive: str, block: str, names: list[str]) -> int:
+    """A commit build owns no GitHub release and no channel page: its claim archive's page
+    (already written) and the run summary are its whole publication."""
+    if args.pending_run_url:
+        parser.error("A commit build has no release body to hold a builds-in-progress link")
+    if args.summary_out:
+        with open(args.summary_out, "a", encoding="utf-8") as out:
+            out.write(f"## Commit build {args.tag}\n\n"
+                      f"Builds page: {r2.public_url_for(args.r2_base_url, r2.staging_key_for(archive, 'index.html'))}\n\n"
+                      + block)
+    print(f"✓ Commit build page rendered for {args.tag} ({len(names)} assets scanned)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channel-build")
@@ -692,37 +753,7 @@ def main() -> int:
         smoke_results = candidate["smoke_results"]
 
     if args.summary_commit:
-
-        if not args.summary_out:
-            print("::error::--summary-out is required with --summary-commit")
-            return 1
-        if not args.r2_base_url:
-            print("::error::--r2-base-url (or CLOUDFLARE_R2_PUBLIC_URL) is required to render the summary")
-            return 1
-        commit = args.summary_commit
-        try:
-            from scripts.releases.bundle_env import decode
-
-            bundle_env = decode(args.bundle_env_json)
-            prefix = r2.commit_prefix_for(commit)
-        except ValueError as err:
-            print(f"::error::{err}")
-            return 1
-        names = r2_object_names_under(prefix)
-        receipts = read_commit_receipts(commit)
-        failed_legs = (failed_legs_from_release_needs(os.environ.get("RELEASE_NEEDS"))
-                       or [leg.strip() for leg in args.summary_failed_legs.split(",") if leg.strip()])
-        block = render_commit_summary(names, args.r2_base_url, commit, receipts, failed_legs, args.run_url,
-                                      smoke_results=smoke_results)
-        with open(args.summary_out, "a", encoding="utf-8") as out:
-            out.write(block)
-        write_page(r2.commit_page_key_for(commit),
-                   render_commit_page(commit, names, args.r2_base_url, receipts, failed_legs, args.run_url,
-                                      repo=args.repo, bundle_env=bundle_env, smoke_results=smoke_results),
-                   args.r2_base_url)
-        built = sum(1 for row in commit_expected_rows(names, receipts) if row["state"] == "built")
-        print(f"✓ Commit summary appended to {args.summary_out} ({built}/{len(_COMMIT_EXPECTED)} binaries built)")
-        return 0
+        return _render_commit_summary(args, smoke_results)
 
     if not args.tag:
         parser.error("--tag is required (or use --summary-commit for a commit build summary)")
@@ -746,31 +777,12 @@ def main() -> int:
         # A failed run still owns its tag page, never the channel pointer
         # consumed by source updates. Missing artifacts never become downloads.
         if not args.dry_run:
-            from hermes_cli.update_channel import is_commit_tag
-            from scripts.releases.bundle_env import decode
-
-            commit_page = is_commit_tag(archive)
-            write_page(r2.staging_key_for(archive, "index.html"),
-                       render_page(archive, assets, args.r2_base_url, incomplete, args.run_url,
-                                   repo=args.repo, smoke_results=smoke_results,
-                                   commit=args.candidate_commit if commit_page else None,
-                                   bundle_env=decode(args.bundle_env_json) if commit_page else None),
-                       args.r2_base_url)
+            _write_tag_page(args, archive, assets, incomplete, smoke_results)
 
     from hermes_cli.update_channel import is_commit_tag
 
     if is_commit_tag(args.tag):
-        # A commit build owns no GitHub release and no channel page: its claim archive's page
-        # (written above) and the run summary are its whole publication.
-        if args.pending_run_url:
-            parser.error("A commit build has no release body to hold a builds-in-progress link")
-        if args.summary_out:
-            with open(args.summary_out, "a", encoding="utf-8") as out:
-                out.write(f"## Commit build {args.tag}\n\n"
-                          f"Builds page: {r2.public_url_for(args.r2_base_url, r2.staging_key_for(archive, 'index.html'))}\n\n"
-                          + block)
-        print(f"✓ Commit build page rendered for {args.tag} ({len(names)} assets scanned)")
-        return 0
+        return _finish_commit_build(args, parser, archive, block, names)
 
     # Keep the per-tag diagnostic page even when GitHub cannot supply a draft.
     view = subprocess.run(

@@ -107,6 +107,17 @@ def _resolve_dirty_from_git() -> bool:
     return status is not None and len(status) > 0
 
 
+def _require_commit_tag_pairing(commit_build: str | None, tag: str | None) -> None:
+    """A commit build carries no tag or only its own claim tag (commit.<stamp>-vX.Y.Z), and a commit
+    claim tag only ever stamps a commit build: the stamp says source commit-build either way, so
+    every updater refuses it."""
+    commit_tag = bool(tag) and update_channel.is_commit_tag(tag)
+    if commit_build and tag and not commit_tag:
+        raise ValueError("Commit builds cannot also select a release tag")
+    if commit_tag and not commit_build:
+        raise ValueError("A commit build tag requires HERMES_BUILD_COMMIT (the commit identity)")
+
+
 def build_stamp(
     *,
     update_mechanism: str,
@@ -160,15 +171,11 @@ def build_stamp(
         commit_date = int(git(_REPO_ROOT, "log", "-1", "--format=%ct", "HEAD"))
 
     commit_build = os.environ.get("HERMES_BUILD_COMMIT")
+    _require_commit_tag_pairing(commit_build, os.environ.get("HERMES_PAYLOAD_TAG"))
     if commit_build:
         from scripts.releases.commit_build import require_commit
 
         require_commit(commit_build)
-        # A commit build may carry only its own claim tag (commit.<stamp>-vX.Y.Z): the stamp still
-        # says source commit-build, so every updater refuses it.
-        payload_tag = os.environ.get("HERMES_PAYLOAD_TAG")
-        if payload_tag and not update_channel.is_commit_tag(payload_tag):
-            raise ValueError("Commit builds cannot also select a release tag")
         if _resolve_commit_from_git() != commit_build or commit not in (None, commit_build):
             raise ValueError("Commit build identity does not match the checkout HEAD")
         commit, source, update_mechanism = commit_build, "commit-build", "external"
@@ -246,8 +253,6 @@ def build_stamp(
     tag = os.environ.get("HERMES_PAYLOAD_TAG") or None
 
     _stable_tag = re.compile(r"^v(0|[1-9]\d{0,2})\.\d+\.\d+$")
-    if tag and update_channel.is_commit_tag(tag) and not commit_build:
-        raise ValueError("A commit build tag requires HERMES_BUILD_COMMIT (the commit identity)")
     if payload != "bootstrap" and not commit_build and channel_request is None and not (
         tag and (_stable_tag.match(tag) or update_channel.is_canary_tag(tag))
     ):

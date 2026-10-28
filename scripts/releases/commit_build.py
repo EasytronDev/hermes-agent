@@ -211,6 +211,23 @@ def dispatch_command(tag: str, repository: str, branch: str) -> list[str]:
             "-f", f"tag={tag}"]
 
 
+def _unused_claim_tag(release, version: str) -> str:
+    """commit.<now>-v<version>, moved forward a second at a time past any claim already tagged here
+    (two builds started within one second). A claim another clone pushed meanwhile still fails the
+    push rather than being replaced."""
+    from datetime import timedelta
+
+    from hermes_cli.update_channel import commit_tag_for_date
+
+    moment = datetime.now(UTC).replace(microsecond=0)
+    for _ in range(60):
+        tag = commit_tag_for_date(version, moment.strftime("%Y%m%dT%H%M%SZ"))
+        if release.git_result("rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode != 0:
+            return tag
+        moment += timedelta(seconds=1)
+    raise ValueError("every commit claim stamp for the next minute is already tagged here")
+
+
 def cmd_build_commit(args) -> None:
     """--build-commit REV: claim a commit build and run the Stable Release pipeline on it.
 
@@ -220,7 +237,6 @@ def cmd_build_commit(args) -> None:
     (--[no-]require-green), plus the bundle defaults (--bundle-env/--bundle-unset). Without
     --publish nothing is created.
     """
-    from hermes_cli.update_channel import commit_tag_for_date
     from scripts import release
     from scripts.releases import lanes as lane_set, r2
     from scripts.releases.bundle_env import parse_assignments
@@ -239,7 +255,7 @@ def cmd_build_commit(args) -> None:
         branch = release._default_branch(repository)
         if not branch:
             raise ValueError("could not resolve the repository default branch")
-        tag = commit_tag_for_date(version, datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"))
+        tag = _unused_claim_tag(release, version)
         message = claim_message(version=version, commit=commit, lanes=lanes,
                                 require_green=args.require_green, bundle_env=bundle_env)
         command = dispatch_command(tag, repository, branch)
