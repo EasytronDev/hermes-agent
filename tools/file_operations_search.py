@@ -165,10 +165,14 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 #   find: ``find: '<path>': Permission denied`` (pruned grep lane; GNU find quotes the
 #         path with ASCII ``'`` or, in a UTF-8 locale, with typographic quotes)
 # The ``(os error N)`` suffix is ripgrep's Rust io::Error spelling, so it is optional.
+# The tool prefix is required: the shell's own ``bash: <path>/rg: Permission denied``
+# (the engine binary itself is not executable) is a failed invocation, not a skip.
 _PERMISSION_DENIED_RE = re.compile(
-    r"^(?:(?P<tool>rg|grep|find): )?(?P<path>.+?): "
+    r"^(?P<tool>rg|grep|find): (?P<path>.+?): "
     r"(?:IO error for operation on .+?: )?Permission denied(?: \(os error \d+\))?$")
 
+
+_SHELL_EXEC_FAILURE_CODES = frozenset({126, 127})
 
 _FIND_QUOTES_RE = re.compile(r"^['\u2018]|['\u2019]$")
 
@@ -378,6 +382,10 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     usable payload remains. ``warning`` is attached to files_only/content results."""
     stdout, limit_reason = _search_stdout_and_limit(result)
     diagnostics, payload = _split_tool_diagnostics(stdout)
+    if result.exit_code in _SHELL_EXEC_FAILURE_CODES:
+        # The shell could not run the engine at all (126 not executable, 127 not found).
+        return SearchResult(error=f"Search failed: {result.stdout.strip() or 'Search error'}",
+                            total_count=0)
     if result.exit_code == 2 and not payload.strip():
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
         if _is_permission_only_error(error_msg):

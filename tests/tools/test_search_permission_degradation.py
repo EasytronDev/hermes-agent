@@ -322,6 +322,18 @@ def test_content_search_hard_error_regex_still_surfaced():
     assert result.warning is None
 
 
+@pytest.mark.parametrize("code", [126, 2])
+def test_content_search_engine_binary_not_executable_is_an_error(code):
+    """The shell refusing to run rg itself is a broken invocation, not a skipped path."""
+    env = RecordingEnvironment(rg_output="bash: /usr/bin/rg: Permission denied\n", rg_code=code)
+
+    result = ShellFileOperations(env).search("needle", path="/repo", target="content")
+
+    assert result.error is not None
+    assert "/usr/bin/rg: Permission denied" in result.error
+    assert "unreadable path" not in (result.warning or "")
+
+
 # --- content search, grep lane (rg absent) ---------------------------------------
 
 
