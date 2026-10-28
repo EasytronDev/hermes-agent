@@ -6413,8 +6413,9 @@ def _define_discord_view_classes() -> None:
         def _first_embed(message):
             return message.embeds[0] if message.embeds else None
 
-        async def _expire_embed(self, footer: str) -> None:
-            """Grey out the original message's embed after a timeout (best effort)."""
+        async def _expire_embed(self, footer: str, *, keep_controls: bool = True) -> None:
+            """Grey out the original message's embed and stamp ``footer`` (best effort). The disabled
+            buttons stay unless ``keep_controls`` is False, which removes them."""
             msg = self._message
             if msg:
                 try:
@@ -6422,9 +6423,9 @@ def _define_discord_view_classes() -> None:
                     if embed:
                         embed.color = discord.Color.greyple()
                         embed.set_footer(text=footer)
-                    await msg.edit(embed=embed, view=self)
+                    await msg.edit(embed=embed, view=self if keep_controls else None)
                 except Exception:
-                    pass  # message deleted or too old to edit
+                    logger.debug("[Discord] Could not stamp prompt card", exc_info=True)  # deleted / too old
 
         async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
             """Mark resolved, stamp the embed (color + footer), disable buttons, edit in place, then
