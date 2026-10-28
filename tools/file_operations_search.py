@@ -243,6 +243,33 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
 
 _PERMISSION_SEARCH_HINT = "Nothing matched in the readable part of the search scope."
 
+_SKIPPED_WARNING_RE = re.compile(
+    r"Skipped (?P<count>\d+) unreadable path\(s\) with restricted permissions: (?P<shown>.*?)"
+    r"(?: \(\+\d+ more\))?\. Results may be incomplete; fix permissions or run as a user that "
+    r"can read them to include them\.")
+
+
+def _merge_child_warnings(warnings: list[Optional[str]], has_results: bool) -> list[str]:
+    """Combine per-root search warnings into one list: skipped-path sentences collapse
+    into a single sentence with the summed count, the rest are deduplicated in order.
+    The nothing-matched hint is dropped once any root produced results."""
+    total, shown, rest = 0, [], []
+    for warning in filter(None, warnings):
+        for match in _SKIPPED_WARNING_RE.finditer(warning):
+            total += int(match.group("count"))
+            shown.extend(p for p in match.group("shown").split(", ") if p and p not in shown)
+        for piece in _SKIPPED_WARNING_RE.sub("\0", warning).split("\0"):
+            piece = piece.strip()
+            if has_results:
+                piece = piece.replace(_PERMISSION_SEARCH_HINT, "").strip()
+            if piece and piece not in rest:
+                rest.append(piece)
+    if not total:
+        return rest
+    kept = shown[:3]
+    sentence = _skipped_unreadable_warning(kept, max(total - len(kept), 0))
+    return [sentence, *rest]
+
 
 _FIND_MODIFIED_ORDER_ERROR = (
     "Exact modification-time order requires GNU find with "
@@ -787,12 +814,14 @@ class SearchMixin:
             # One global traversal across roots so modified ordering and pagination
             # are exact; root admission wraps the actual rg/find invocation.
             merged = self._search_files(pattern, existing, limit, offset, order)
+            child_warnings = [merged.warning]
         else:
-            merged = SearchResult()
+            merged, child_warnings = SearchResult(), []
             for root in existing:
                 sub = self._search_content(pattern, root, file_glob, limit, offset, output_mode, context)
                 if sub.error:
                     return sub
+                child_warnings.append(sub.warning)
                 merged.matches.extend(sub.matches)
                 merged.files.extend(sub.files)
                 merged.counts.update(sub.counts)
@@ -805,7 +834,8 @@ class SearchMixin:
             note += "; skipped missing: " + ", ".join(missing[:3])
             if len(missing) > 3:
                 note += f" (+{len(missing) - 3} more)"
-        warning_parts = [note]
+        has_results = bool(merged.total_count or merged.matches or merged.files or merged.counts)
+        warning_parts = [*_merge_child_warnings(child_warnings, has_results), note]
         if not merged.error:
             protected_paths = [absolute for _r, _rel, absolute in self._effective_macos_search_exclusions(existing)]
             if protected_paths:
