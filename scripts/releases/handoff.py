@@ -287,7 +287,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["stage", "fetch"])
     parser.add_argument("--tag", default=os.environ.get("HERMES_PAYLOAD_TAG") or os.environ.get("RELEASE_TAG"), required=False)
-    parser.add_argument("--commit-build", default=os.environ.get("HERMES_BUILD_COMMIT"),
+    # Explicit only: a commit claim's legs export HERMES_BUILD_COMMIT (its Commit<sha7> identity)
+    # beside the claim tag, and stage under the claim archive like every candidate.
+    parser.add_argument("--commit-build", default=None,
                         help="Commit-only mode: stage/fetch under releases/commit/<sha>/ "
                              "with schema-2 receipts (no tag; exact full SHA required)")
     parser.add_argument("--channel-request", type=Path, help="Pinned admitted channel request JSON")

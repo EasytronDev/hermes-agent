@@ -251,3 +251,16 @@ def test_public_handoff_rejects_unsafe_origins_paths_and_redirects(tmp_path, r2_
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_a_commit_claim_stages_under_its_claim_despite_its_commit_identity_env(tmp_path, monkeypatch):
+    # A commit claim's legs export HERMES_BUILD_COMMIT (the Commit<sha7> identity) beside the claim
+    # tag; the handoff CLI must stage under the claim archive, never fall into tagless commit mode.
+    commit, tag = "a" * 40, "commit.20261026T180000Z-v1.2.3"
+    monkeypatch.setenv("HERMES_BUILD_COMMIT", commit)
+    calls = []
+    monkeypatch.setattr(handoff, "stage", lambda *args: calls.append(("tag", *args)))
+    monkeypatch.setattr(handoff, "stage_commit_build", lambda *args: calls.append(("commit", *args)))
+    handoff.main(["stage", "--tag", tag, "--commit", commit, "--name", "win32-x64",
+                  "--root", str(tmp_path), "--include", "*.msix"])
+    assert calls == [("tag", tag, commit, "win32-x64", tmp_path, ["*.msix"])]
