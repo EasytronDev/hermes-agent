@@ -1026,7 +1026,8 @@ class SearchMixin:
                 detail = f": {diagnostics[0]}" if diagnostics else "."
                 return SearchResult(error=f"File search failed while running bounded find traversal{detail}")
             partial_warning = partial_warning or (
-                "find traversal reported errors for some paths; results may be incomplete.")
+                "find traversal skipped one or more unreadable paths (restricted "
+                "permissions); results are partial.")
 
         from tools.environments.base import env_uses_host_filesystem
         from tools.environments.local import _IS_WINDOWS, _msys_to_windows_path
@@ -1101,21 +1102,15 @@ class SearchMixin:
         # exit 124 = timed out while ALSO skipping them (warning rides along).
         skipped = _extract_unreadable_paths(diagnostics) \
             if _is_permission_only_error(diagnostics) else []
-        partial_walk = result.exit_code == 2 and bool(skipped)
+        permission_only = result.exit_code == 2 and bool(skipped)
         warning = _skipped_unreadable_warning(skipped) if skipped else None
-        # Any other exit-2 diagnostic beside real output is still a partial walk
-        # (rg prints every path it could list): keep the files, name the first error.
-        if result.exit_code == 2 and all_files and not skipped:
-            partial_walk = True
-            first = diagnostics.strip().splitlines()[0] if diagnostics.strip() else "no diagnostics"
-            warning = f"ripgrep reported errors for some paths; results may be incomplete ({first})."
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
         if (result.exit_code not in {0, 1, 124} and not bounded_sigpipe
-                and not partial_walk):
+                and not permission_only):
             detail = diagnostics.strip() or "no diagnostics"
             if order == "modified":
                 # ripgrep 14+ was already verified by the capability gate, so this
@@ -1142,7 +1137,7 @@ class SearchMixin:
                 # the merged view keeps the newest-first contract globally.
                 all_files = merged_entries
                 limit_reason = limit_reason or directory_limit_reason
-        if partial_walk and not all_files:
+        if permission_only and not all_files:
             return SearchResult(files=[], total_count=0,
                                 warning=f"{warning} {_PERMISSION_SEARCH_HINT}")
         return SearchResult(
