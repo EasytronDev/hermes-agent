@@ -354,7 +354,9 @@ jobs:
           python -m scripts.ci.desktop_commands "$RUNNER_TEMP/desktop-job/prepared.json"
 
       - name: Save dependency inputs before building
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        # Only reviewed claims (stable, canary) write the shared cache; commit and
+        # channel claims build unreviewed commits and only read it.
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') }}
         uses: ./.github/actions/desktop-build-cache
         with:
           phase: save
@@ -622,7 +624,9 @@ jobs:
           python3 -m scripts.ci.desktop_commands "$RUNNER_TEMP/desktop-job/prepared.json"
 
       - name: Save dependency inputs before building
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        # Only reviewed claims (stable, canary) write the shared cache; commit and
+        # channel claims build unreviewed commits and only read it.
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.') }}
         uses: ./.github/actions/desktop-build-cache
         with:
           phase: save
@@ -935,8 +939,7 @@ jobs:
     if: >-
       !cancelled() && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.build-darwin-arm64.result == 'success' && needs.validate.outputs.darwin-arm64 == 'true'
-      && (inputs.release-phase != 'candidate' || needs.stage-receipt-darwin-arm64.result == 'success')
-      && inputs.release-phase == 'candidate'
+      && needs.stage-receipt-darwin-arm64.result == 'success'
       && inputs.release-phase == 'candidate'
       && inputs.skip-tests != true
     permissions:
@@ -966,8 +969,7 @@ jobs:
     if: >-
       !cancelled() && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.build-darwin-x64.result == 'success' && needs.validate.outputs.darwin-x64 == 'true'
-      && (inputs.release-phase != 'candidate' || needs.stage-receipt-darwin-x64.result == 'success')
-      && inputs.release-phase == 'candidate'
+      && needs.stage-receipt-darwin-x64.result == 'success'
       && inputs.release-phase == 'candidate'
       && inputs.skip-tests != true
     permissions:
@@ -1004,7 +1006,6 @@ jobs:
         || (inputs.windows-smokes-with-bundle == true && needs.validate.outputs.win32-bundle == 'true'
            && (needs.validate.outputs.win32-x64 != 'true' || needs.build-win32-x64.result == 'success')))
       && inputs.release-phase == 'candidate'
-      && inputs.release-phase == 'candidate'
       && inputs.skip-tests != true
       && inputs.skip-signed != true
     permissions:
@@ -1033,7 +1034,6 @@ jobs:
            && needs.build-win32-arm64.result == 'success' && needs.validate.outputs.win32-arm64 == 'true')
         || (inputs.windows-smokes-with-bundle == true && needs.validate.outputs.win32-bundle == 'true'
            && (needs.validate.outputs.win32-arm64 != 'true' || needs.build-win32-arm64.result == 'success')))
-      && inputs.release-phase == 'candidate'
       && inputs.release-phase == 'candidate'
       && inputs.skip-tests != true
       && inputs.skip-signed != true
@@ -1067,7 +1067,6 @@ jobs:
       && needs.validate.outputs.win32-bundle == 'true'
       && (needs.validate.outputs.win32-x64 != 'true' || needs.build-win32-x64.result == 'success')
       && (needs.validate.outputs.win32-arm64 != 'true' || needs.build-win32-arm64.result == 'success')
-      && inputs.release-phase == 'candidate'
       && inputs.release-phase == 'candidate'
     runs-on: blacksmith-32vcpu-windows-2025
     environment: release-signing
