@@ -220,6 +220,57 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
 _PERMISSION_SEARCH_HINT = "Nothing matched in the readable part of the search scope."
 
 
+_FIND_MODIFIED_ORDER_ERROR = (
+    "Exact modification-time order requires GNU find with "
+    "-printf support; install ripgrep 14+ or use order='discovery'.")
+
+
+def _split_find_output(stdout: str, order: str) -> tuple[list[str], list[str]]:
+    """``(paths, diagnostics)`` from a bounded find run; ``find: `` lines are stderr."""
+    raw_files: list[str] = []
+    diagnostics: list[str] = []
+    for line in stdout.splitlines():
+        if line.startswith("find: "):
+            diagnostics.append(line)
+        elif order == "modified":
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and parts[0].replace(".", "", 1).isdigit():
+                raw_files.append(parts[1])
+        elif line:
+            raw_files.append(line)
+    return raw_files, diagnostics
+
+
+def _find_exit_verdict(exit_code: int, raw_files: list[str], diagnostics: list[str],
+                       fetch_limit: int, order: str) -> tuple[Optional[SearchResult], Optional[str]]:
+    """``(terminal result or None, warning)`` for a bounded find run.
+
+    Exit 141 is benign only when the payload proves head closed the pipe at the
+    bound. find exits 1 when traversal hit unreadable dirs (EACCES) but still prints
+    what it could read: a partial success, named from its diagnostics. Exit 1 with no
+    payload is a real failure unless every diagnostic is such a skip (bad expressions
+    and BSD find's missing -printf also exit 1)."""
+    bounded_sigpipe = exit_code == 141 and len(raw_files) >= fetch_limit
+    if exit_code not in {0, 1, 124} and not bounded_sigpipe:
+        if order == "modified":
+            return SearchResult(error=_FIND_MODIFIED_ORDER_ERROR), None
+        return SearchResult(error="File search failed while running bounded find traversal."), None
+    diagnostic_text = "\n".join(diagnostics)
+    skipped = _extract_unreadable_paths(diagnostic_text)
+    warning = _skipped_unreadable_warning(skipped) if skipped else None
+    if exit_code != 1:
+        return None, warning
+    if not raw_files and _is_permission_only_error(diagnostic_text):
+        return SearchResult(total_count=0, warning=f"{warning} {_PERMISSION_SEARCH_HINT}"), None
+    if not raw_files:
+        if order == "modified":
+            return SearchResult(error=_FIND_MODIFIED_ORDER_ERROR), None
+        detail = f": {diagnostics[0]}" if diagnostics else "."
+        return SearchResult(error=f"File search failed while running bounded find traversal{detail}"), None
+    return None, warning or ("find traversal skipped one or more unreadable paths (restricted "
+                             "permissions); results are partial.")
+
+
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
     """Parse a ``path-line-content`` context line using the RIGHTMOST numeric
     separator (filenames may contain ``-<digits>-`` segments):
@@ -476,7 +527,8 @@ class SearchMixin:
         err_drainer = None
         if merge_stderr:
             err_pipe = proc.stderr
-            err_drainer = threading.Thread(target=lambda: err_chunks.extend(err_pipe or ()), daemon=True)
+            err_drainer = threading.Thread(  # health: allow HX012 -- pipe drainer, reads no profile-scoped state
+                target=lambda: err_chunks.extend(err_pipe or ()), daemon=True)
             err_drainer.start()
         deadline = time.monotonic() + timeout
         exit_code: Optional[int] = None
@@ -986,48 +1038,11 @@ class SearchMixin:
             _release_filename_search_roots(keys)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
-        # Parse BEFORE classifying exit 141: under pipefail a bounded producer gets
-        # SIGPIPE when head closes after fetch_limit rows — benign only when the
-        # payload proves the bound was reached; a shorter payload is a hard failure.
-        raw_files: list[str] = []
-        diagnostics: list[str] = []
-        for line in stdout.splitlines():
-            if line.startswith("find: "):
-                diagnostics.append(line)
-            elif order == "modified":
-                parts = line.split(" ", 1)
-                if len(parts) != 2 or not parts[0].replace(".", "", 1).isdigit():
-                    continue
-                raw_files.append(parts[1])
-            elif line:
-                raw_files.append(line)
-        bounded_sigpipe = result.exit_code == 141 and len(raw_files) >= fetch_limit
-        if result.exit_code not in {0, 1, 124} and not bounded_sigpipe:
-            if order == "modified":
-                return SearchResult(error=(
-                    "Exact modification-time order requires GNU find with "
-                    "-printf support; install ripgrep 14+ or use order='discovery'."))
-            return SearchResult(error="File search failed while running bounded find traversal.")
-        # find exits 1 when traversal hit unreadable dirs (EACCES) but still prints
-        # what it could read: a partial success, named from its diagnostics. Exit 1
-        # with no payload is a real failure unless every diagnostic is such a skip
-        # (bad expressions and BSD find's missing -printf also exit 1).
-        diagnostic_text = "\n".join(diagnostics)
-        skipped = _extract_unreadable_paths(diagnostic_text)
-        partial_warning = _skipped_unreadable_warning(skipped) if skipped else None
-        if result.exit_code == 1 and not bounded_sigpipe:
-            if not raw_files and _is_permission_only_error(diagnostic_text):
-                return SearchResult(total_count=0, warning=f"{partial_warning} {_PERMISSION_SEARCH_HINT}")
-            if not raw_files:
-                if order == "modified":
-                    return SearchResult(error=(
-                        "Exact modification-time order requires GNU find with "
-                        "-printf support; install ripgrep 14+ or use order='discovery'."))
-                detail = f": {diagnostics[0]}" if diagnostics else "."
-                return SearchResult(error=f"File search failed while running bounded find traversal{detail}")
-            partial_warning = partial_warning or (
-                "find traversal skipped one or more unreadable paths (restricted "
-                "permissions); results are partial.")
+        raw_files, diagnostics = _split_find_output(stdout, order)
+        failure, partial_warning = _find_exit_verdict(result.exit_code, raw_files, diagnostics,
+                                                      fetch_limit, order)
+        if failure is not None:
+            return failure
 
         from tools.environments.base import env_uses_host_filesystem
         from tools.environments.local import _IS_WINDOWS, _msys_to_windows_path
