@@ -204,8 +204,8 @@ def _compact_unreadable_paths(paths: list[str], keep: int = 3) -> str:
 def _skipped_unreadable_warning(paths: list[str]) -> str:
     return ("Skipped " + str(len(paths)) + " unreadable path(s) with restricted "
             "permissions: " + _compact_unreadable_paths(paths)
-            + ". Results are partial; fix permissions or search the path directly "
-            "to include it.")
+            + ". Results may be incomplete; fix permissions or run as a user that "
+            "can read them to include them.")
 
 
 def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) -> Optional[str]:
@@ -217,10 +217,7 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
     return warning if not existing else f"{warning} {existing}"
 
 
-_PERMISSION_SEARCH_HINT = (
-    "Every reported path was skipped for restricted permissions, so the searchable "
-    "scope itself is unreadable: fix permissions (e.g. chown the path back to the "
-    "service user) or search a readable subtree.")
+_PERMISSION_SEARCH_HINT = "Nothing matched in the readable part of the search scope."
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
@@ -296,7 +293,12 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                 warning = f"{warning} {_PERMISSION_SEARCH_HINT}"
             return SearchResult(total_count=0, warning=warning)
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
-    warning = _prepend_skipped_paths_warning(diagnostics, warning)
+    skipped_warning = _prepend_skipped_paths_warning(diagnostics, None)
+    tool_errors = [ln.strip() for ln in diagnostics.splitlines() if ln.lstrip().startswith(("rg: ", "grep: "))]
+    if not skipped_warning and result.exit_code == 2 and tool_errors:
+        skipped_warning = f"The search reported errors for some paths; results may be incomplete ({tool_errors[0]})."
+    if skipped_warning:
+        warning = skipped_warning if not warning else f"{skipped_warning} {warning}"
     lines = [ln for ln in payload.strip().split('\n') if ln]
     if output_mode == "files_only":
         return SearchResult(
@@ -440,16 +442,18 @@ class SearchMixin:
         stdout follow the shell contract (rg 0/1/2; 124 on timeout with partial
         output; 130 on interrupt), so ``_parse_search_output`` is shared. Once the
         bound is reached rg is killed like ``head`` closing the pipe would.
-        ``merge_stderr`` mirrors the shell path's stderr handling: merged for content
-        search (diagnostics feed the error message), discarded (``2>/dev/null``) for
-        file lists and probes."""
+        ``merge_stderr`` mirrors the shell path's stderr handling: kept for real
+        searches (diagnostics name unreadable paths or the error), discarded
+        (``2>/dev/null``) for probes. Like the shell's ``2>&1``-free ``| head``, kept
+        stderr is drained on its own pipe so diagnostics never use up the
+        ``fetch_limit`` lines meant for results; it is prepended to stdout."""
         from tools.environments.local import _kill_process_group_posix, _make_run_env
         cwd = getattr(self.env, "cwd", None) or self.cwd
         args = shlex.split(" ".join(argv))
         try:
             proc = subprocess.Popen(
                 args, cwd=cwd, env=_make_run_env(self.env.env), stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE if merge_stderr else subprocess.DEVNULL,
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
@@ -468,6 +472,12 @@ class SearchMixin:
 
         drainer = threading.Thread(target=_drain, daemon=True)
         drainer.start()
+        err_chunks: list[bytes] = []
+        err_drainer = None
+        if merge_stderr:
+            err_pipe = proc.stderr
+            err_drainer = threading.Thread(target=lambda: err_chunks.extend(err_pipe or ()), daemon=True)
+            err_drainer.start()
         deadline = time.monotonic() + timeout
         exit_code: Optional[int] = None
         while True:
@@ -486,6 +496,11 @@ class SearchMixin:
         drainer.join()
         proc.stdout.close()
         stdout = b"".join(lines).decode("utf-8", errors="replace")
+        if err_drainer is not None:
+            err_drainer.join()
+            if proc.stderr is not None:
+                proc.stderr.close()
+            stdout = b"".join(err_chunks).decode("utf-8", errors="replace") + stdout
         if exit_code == 124:
             return ExecuteResult(stdout=stdout + f"\n[Command timed out after {timeout}s]", exit_code=124)
         if exit_code == 130:
@@ -955,10 +970,12 @@ class SearchMixin:
         base = (f"find -H {' '.join(q_roots)}{protected_prune}{hidden_prune} "
                 f"\\( -type f -o \\( -type d{root_exemptions} \\) \\) "
                 f"! -name '.*' -name {self._escape_shell_arg(search_pattern)}")
+        # find's stderr is not piped into sort/head, so ``find: '<dir>': Permission
+        # denied`` lines reach the merged output without using up result rows.
         if order == "modified":
-            cmd = "set -o pipefail; " + base + f" -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -n {fetch_limit}"
+            cmd = "set -o pipefail; " + base + f" -printf '%T@ %p\\n' | sort -rn | head -n {fetch_limit}"
         else:
-            cmd = "set -o pipefail; " + base + f" -print 2>/dev/null | head -n {fetch_limit}"
+            cmd = "set -o pipefail; " + base + f" -print | head -n {fetch_limit}"
 
         keys = _filename_search_root_keys(self.env, roots, self.cwd)
         if not _acquire_filename_search_roots(keys):
@@ -973,8 +990,11 @@ class SearchMixin:
         # SIGPIPE when head closes after fetch_limit rows — benign only when the
         # payload proves the bound was reached; a shorter payload is a hard failure.
         raw_files: list[str] = []
+        diagnostics: list[str] = []
         for line in stdout.splitlines():
-            if order == "modified":
+            if line.startswith("find: "):
+                diagnostics.append(line)
+            elif order == "modified":
                 parts = line.split(" ", 1)
                 if len(parts) != 2 or not parts[0].replace(".", "", 1).isdigit():
                     continue
@@ -988,22 +1008,25 @@ class SearchMixin:
                     "Exact modification-time order requires GNU find with "
                     "-printf support; install ripgrep 14+ or use order='discovery'."))
             return SearchResult(error="File search failed while running bounded find traversal.")
-        # GNU find exits 1 when traversal hit unreadable dirs (EACCES et al.) but
-        # still prints what it could read. With a payload that is a partial-success
-        # condition (stderr is discarded, so the paths cannot be named here); with
-        # an empty payload it is a real failure (parse errors also exit 1).
-        partial_warning: Optional[str] = None
+        # find exits 1 when traversal hit unreadable dirs (EACCES) but still prints
+        # what it could read: a partial success, named from its diagnostics. Exit 1
+        # with no payload is a real failure unless every diagnostic is such a skip
+        # (bad expressions and BSD find's missing -printf also exit 1).
+        diagnostic_text = "\n".join(diagnostics)
+        skipped = _extract_unreadable_paths(diagnostic_text)
+        partial_warning = _skipped_unreadable_warning(skipped) if skipped else None
         if result.exit_code == 1 and not bounded_sigpipe:
+            if not raw_files and _is_permission_only_error(diagnostic_text):
+                return SearchResult(total_count=0, warning=f"{partial_warning} {_PERMISSION_SEARCH_HINT}")
             if not raw_files:
                 if order == "modified":
                     return SearchResult(error=(
                         "Exact modification-time order requires GNU find with "
                         "-printf support; install ripgrep 14+ or use order='discovery'."))
-                return SearchResult(error="File search failed while running bounded find traversal.")
-            partial_warning = (
-                "find traversal skipped one or more unreadable paths (restricted "
-                "permissions); results are partial. Fix permissions or search a "
-                "readable subtree to include them.")
+                detail = f": {diagnostics[0]}" if diagnostics else "."
+                return SearchResult(error=f"File search failed while running bounded find traversal{detail}")
+            partial_warning = partial_warning or (
+                "find traversal reported errors for some paths; results may be incomplete.")
 
         from tools.environments.base import env_uses_host_filesystem
         from tools.environments.local import _IS_WINDOWS, _msys_to_windows_path
@@ -1078,15 +1101,21 @@ class SearchMixin:
         # exit 124 = timed out while ALSO skipping them (warning rides along).
         skipped = _extract_unreadable_paths(diagnostics) \
             if _is_permission_only_error(diagnostics) else []
-        permission_only = result.exit_code == 2 and bool(skipped)
+        partial_walk = result.exit_code == 2 and bool(skipped)
         warning = _skipped_unreadable_warning(skipped) if skipped else None
+        # Any other exit-2 diagnostic beside real output is still a partial walk
+        # (rg prints every path it could list): keep the files, name the first error.
+        if result.exit_code == 2 and all_files and not skipped:
+            partial_walk = True
+            first = diagnostics.strip().splitlines()[0] if diagnostics.strip() else "no diagnostics"
+            warning = f"ripgrep reported errors for some paths; results may be incomplete ({first})."
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
         if (result.exit_code not in {0, 1, 124} and not bounded_sigpipe
-                and not permission_only):
+                and not partial_walk):
             detail = diagnostics.strip() or "no diagnostics"
             if order == "modified":
                 # ripgrep 14+ was already verified by the capability gate, so this
@@ -1113,7 +1142,7 @@ class SearchMixin:
                 # the merged view keeps the newest-first contract globally.
                 all_files = merged_entries
                 limit_reason = limit_reason or directory_limit_reason
-        if permission_only and not all_files:
+        if partial_walk and not all_files:
             return SearchResult(files=[], total_count=0,
                                 warning=f"{warning} {_PERMISSION_SEARCH_HINT}")
         return SearchResult(
