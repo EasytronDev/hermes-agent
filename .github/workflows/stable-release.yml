@@ -469,6 +469,8 @@ jobs:
           cache-python: false
       - id: manifest
         run: python -m scripts.releases.stable candidate-manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   windows-packaged:
     name: Windows signed-package acceptance
@@ -821,6 +823,7 @@ jobs:
         if: fromJSON(needs.admit.outputs.lanes).bundles
         run: python -m scripts.releases.stable complete
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.admit.outputs.tag }}
           RELEASE_CLAIM_TAG: ${{ needs.admit.outputs.claim-tag }}
           RELEASE_CLAIM_OBJECT: ${{ needs.admit.outputs.claim-object }}

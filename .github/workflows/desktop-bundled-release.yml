@@ -1282,6 +1282,8 @@ jobs:
           cache-python: false
       - id: receipt
         run: python -m scripts.releases.stable stage-receipt --receipt darwin-arm64
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   stage-receipt-darwin-x64:
     name: Stage the darwin-x64 stable receipt
@@ -1317,6 +1319,8 @@ jobs:
           cache-python: false
       - id: receipt
         run: python -m scripts.releases.stable stage-receipt --receipt darwin-x64
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   smoke-darwin-arm64:
     name: Smoke macOS arm64 dmg/zip
@@ -1636,6 +1640,7 @@ jobs:
         if: inputs.release-phase == 'candidate' && inputs.skip-signed != true
         id: receipt
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           CLOUDFLARE_R2_PUBLIC_URL: ${{ needs.validate.outputs.public-root }}
         run: python -m scripts.releases.stable stage-receipt --receipt win32-bundle
