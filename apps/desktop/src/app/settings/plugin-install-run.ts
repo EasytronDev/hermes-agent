@@ -160,6 +160,20 @@ async function cloneDesktopHalf(plan: InstallPlan, copy: InstallModalCopy, repor
   await discoverRuntimePlugins()
 }
 
+/** Refresh unified packages' desktop halves. `refusal` is why the half of package `name` was not published
+ *  (a symlink in its tree, too big, unreadable). */
+async function reconcilePackageHalf(name: string): Promise<{ refusal?: string; touched: string[] }> {
+  const desktop = window.hermesDesktop
+
+  if (desktop?.reconcileDesktopPluginsReport) {
+    const { published, refused } = await desktop.reconcileDesktopPluginsReport()
+
+    return { refusal: refused.find(entry => entry.name === name)?.reason, touched: published }
+  }
+
+  return { touched: (await desktop?.reconcileDesktopPlugins?.()) ?? [] }
+}
+
 async function installDesktopHalf(
   plan: InstallPlan,
   components: InstallComponents,
@@ -172,9 +186,13 @@ async function installDesktopHalf(
     // follows updates/uninstall) whether or not the agent install succeeded. A package already on disk
     // answers "already exists" without Force, and cloning would land desktop-plugins/<git-name>/ beside
     // the package copy (#100412).
-    const touched = (await window.hermesDesktop?.reconcileDesktopPlugins?.()) ?? []
+    const { refusal, touched } = await reconcilePackageHalf(
+      agentResult?.pluginName ?? plan.probe.agentName ?? plan.request.repo
+    )
 
-    if (agentResult?.ok || touched.length > 0) {
+    if (refusal) {
+      report.errors.push(refusal)
+    } else if (agentResult?.ok || touched.length > 0) {
       report.successes.push(copy.desktopSuccess(plan.probe.agentName ?? plan.request.repo))
     }
 
