@@ -57,3 +57,32 @@ def test_multi_root_search_reports_every_skipped_path(two_roots, monkeypatch, ta
     assert all(str(path) in warning for path in locked), warning
     assert "Results may be incomplete" in warning
     assert warning.rstrip().endswith("searched 2 that exist"), warning
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads chmod 000 dirs")
+@pytest.mark.parametrize("engine", ["rg", "grep"])
+def test_multi_root_skipped_dir_name_with_comma_survives_merge(tmp_path, monkeypatch, engine):
+    """A skipped directory named ``a, b`` is one path in the merged count and text."""
+    if engine == "rg" and shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    if engine == "grep":
+        monkeypatch.setattr(ShellFileOperations, "_has_command", lambda self, command: command != "rg")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    roots, locked = [tmp_path / "alpha", tmp_path / "beta"], []
+    for root, dirname in zip(roots, ("plain", "one, two")):
+        (root / dirname).mkdir(parents=True)
+        (root / f"{root.name}.py").write_text("needle\n")
+        os.chmod(root / dirname, 0o000)
+        locked.append(root / dirname)
+    try:
+        handler = registry.get_entry("search_files").handler
+        out = json.loads(handler({"pattern": "needle", "target": "content", "path": ",".join(map(str, roots))},
+                                 task_id=f"multi-root-comma-{engine}"))
+    finally:
+        for path in locked:
+            os.chmod(path, 0o755)
+
+    warning = out.get("warning", "")
+    assert "Skipped 2 unreadable path(s)" in warning, warning
+    assert f"permissions: {locked[0]}, {locked[1]}. Results may be incomplete" in warning, warning

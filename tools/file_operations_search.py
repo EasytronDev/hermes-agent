@@ -232,33 +232,45 @@ def _skipped_unreadable_warning(paths: list[str], omitted: int = 0) -> str:
             "can read them to include them.")
 
 
-def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) -> Optional[str]:
-    """Warning naming the skipped unreadable paths, prepended to any existing warning."""
+def _skipped_fields(diagnostics: str) -> dict:
+    """SearchResult skip fields from rg/grep/find diagnostics (nothing skipped → empty lists)."""
     paths = _extract_unreadable_paths(diagnostics)
-    if not paths:
+    return {"skipped_paths": paths, "skipped_omitted": _omitted_diagnostic_count(diagnostics) if paths else 0}
+
+
+def _skipped_sentence(result: SearchResult) -> Optional[str]:
+    """The skipped-paths sentence ``result.warning`` carries, rebuilt from its structured data."""
+    if not result.skipped_paths:
+        return None
+    return _skipped_unreadable_warning(result.skipped_paths, result.skipped_omitted)
+
+
+def _prepend_skipped_paths_warning(skip: dict, existing: Optional[str]) -> Optional[str]:
+    """Warning naming the skipped unreadable paths, prepended to any existing warning."""
+    if not skip["skipped_paths"]:
         return existing
-    warning = _skipped_unreadable_warning(paths, _omitted_diagnostic_count(diagnostics))
+    warning = _skipped_unreadable_warning(skip["skipped_paths"], skip["skipped_omitted"])
     return warning if not existing else f"{warning} {existing}"
 
 
 _PERMISSION_SEARCH_HINT = "Nothing matched in the readable part of the search scope."
 
-_SKIPPED_WARNING_RE = re.compile(
-    r"Skipped (?P<count>\d+) unreadable path\(s\) with restricted permissions: (?P<shown>.*?)"
-    r"(?: \(\+\d+ more\))?\. Results may be incomplete; fix permissions or run as a user that "
-    r"can read them to include them\.")
 
-
-def _merge_child_warnings(warnings: list[Optional[str]], has_results: bool) -> list[str]:
-    """Combine per-root search warnings into one list: skipped-path sentences collapse
-    into a single sentence with the summed count, the rest are deduplicated in order.
-    The nothing-matched hint is dropped once any root produced results."""
+def _merge_child_warnings(children: list[SearchResult], has_results: bool) -> list[str]:
+    """Combine per-root search warnings into one list: the skipped-path sentences collapse
+    into one sentence composed from each child's structured skip data (summed count), the
+    rest of the text is deduplicated in order. The nothing-matched hint is dropped once
+    any root produced results."""
     total, shown, rest = 0, [], []
-    for warning in filter(None, warnings):
-        for match in _SKIPPED_WARNING_RE.finditer(warning):
-            total += int(match.group("count"))
-            shown.extend(p for p in match.group("shown").split(", ") if p and p not in shown)
-        for piece in _SKIPPED_WARNING_RE.sub("\0", warning).split("\0"):
+    for child in children:
+        if not child.warning:
+            continue
+        warning, sentence = child.warning, _skipped_sentence(child)
+        if sentence:
+            total += len(child.skipped_paths) + child.skipped_omitted
+            shown.extend(p for p in child.skipped_paths if p not in shown)
+            warning = warning.replace(sentence, "\0")
+        for piece in warning.split("\0"):
             piece = piece.strip()
             if has_results:
                 piece = piece.replace(_PERMISSION_SEARCH_HINT, "").strip()
@@ -312,7 +324,8 @@ def _find_exit_verdict(exit_code: int, raw_files: list[str], diagnostics: list[s
     if exit_code != 1:
         return None, warning
     if not raw_files and _is_permission_only_error(diagnostic_text):
-        return SearchResult(total_count=0, warning=f"{warning} {_PERMISSION_SEARCH_HINT}"), None
+        return SearchResult(total_count=0, warning=f"{warning} {_PERMISSION_SEARCH_HINT}",
+                            skipped_paths=skipped), None
     if not raw_files:
         if order == "modified":
             return SearchResult(error=_FIND_MODIFIED_ORDER_ERROR), None
@@ -385,6 +398,7 @@ def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str
     if result.error and not _is_line_oriented_newline_error(result.error):
         return result
     result.error = None
+    result.skipped_paths, result.skipped_omitted = [], 0
     result.warning = (
         "0 results found. Note: search_files content search is line-oriented "
         "and does not run ripgrep with -U/--multiline, so `\\n` in the regex "
@@ -419,14 +433,16 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
             # Pure unreadable-path failure: rg read nothing but the invocation was
             # sound. Degrade to an explicit empty result instead of failing — the
             # model can still act on the named paths.
-            warning = _prepend_skipped_paths_warning(error_msg, warning)
+            skip = _skipped_fields(error_msg)
+            warning = _prepend_skipped_paths_warning(skip, warning)
             if not warning:
                 warning = _PERMISSION_SEARCH_HINT
             elif _PERMISSION_SEARCH_HINT not in warning:
                 warning = f"{warning} {_PERMISSION_SEARCH_HINT}"
-            return SearchResult(total_count=0, warning=warning)
+            return SearchResult(total_count=0, warning=warning, **skip)
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
-    skipped_warning = _prepend_skipped_paths_warning(diagnostics, None)
+    skip = _skipped_fields(diagnostics)
+    skipped_warning = _prepend_skipped_paths_warning(skip, None)
     # A non-permission error beside the skips (a path removed mid-search) is named too, not
     # folded into the permission warning.
     other_errors = [ln.strip() for ln in diagnostics.splitlines()
@@ -442,7 +458,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     if output_mode == "files_only":
         return SearchResult(
             files=lines[offset:offset + limit], total_count=len(lines),
-            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning)
+            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning, **skip)
     if output_mode == "count":
         counts = {}
         for line in lines:
@@ -454,7 +470,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                     pass
         return SearchResult(
             counts=counts, total_count=sum(counts.values()),
-            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning)
+            truncated=bool(limit_reason), limit_reason=limit_reason, warning=warning, **skip)
     matches = []
     for line in lines:
         if line == "--":
@@ -474,6 +490,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     return SearchResult(
         matches=matches[offset:offset + limit], total_count=total,
         truncated=total > offset + limit or bool(limit_reason), limit_reason=limit_reason, warning=warning,
+        **skip,
     )
 
 
@@ -814,14 +831,14 @@ class SearchMixin:
             # One global traversal across roots so modified ordering and pagination
             # are exact; root admission wraps the actual rg/find invocation.
             merged = self._search_files(pattern, existing, limit, offset, order)
-            child_warnings = [merged.warning]
+            children = [merged]
         else:
-            merged, child_warnings = SearchResult(), []
+            merged, children = SearchResult(), []
             for root in existing:
                 sub = self._search_content(pattern, root, file_glob, limit, offset, output_mode, context)
                 if sub.error:
                     return sub
-                child_warnings.append(sub.warning)
+                children.append(sub)
                 merged.matches.extend(sub.matches)
                 merged.files.extend(sub.files)
                 merged.counts.update(sub.counts)
@@ -835,7 +852,7 @@ class SearchMixin:
             if len(missing) > 3:
                 note += f" (+{len(missing) - 3} more)"
         has_results = bool(merged.total_count or merged.matches or merged.files or merged.counts)
-        warning_parts = [*_merge_child_warnings(child_warnings, has_results), note]
+        warning_parts = [*_merge_child_warnings(children, has_results), note]
         if not merged.error:
             protected_paths = [absolute for _r, _rel, absolute in self._effective_macos_search_exclusions(existing)]
             if protected_paths:
@@ -1152,7 +1169,8 @@ class SearchMixin:
         return SearchResult(
             files=raw_files[offset:offset + limit], total_count=len(raw_files),
             truncated=len(raw_files) > offset + limit or bool(limit_reason),
-            limit_reason=limit_reason, warning=partial_warning)
+            limit_reason=limit_reason, warning=partial_warning,
+            skipped_paths=_extract_unreadable_paths("\n".join(diagnostics)))
 
     def _search_files_rg(self, pattern: str, path: str | list[str], limit: int, offset: int,
                          order: str = "discovery", rg_executable: Optional[str] = None) -> SearchResult:
@@ -1216,10 +1234,10 @@ class SearchMixin:
         # Permission-denied diagnostics are partial-success signals independent of
         # the exit code: exit 2 = traversal hit unreadable paths (degrade below),
         # exit 124 = timed out while ALSO skipping them (warning rides along).
-        skipped = _extract_unreadable_paths(diagnostics) \
-            if _is_permission_only_error(diagnostics) else []
-        permission_only = result.exit_code == 2 and bool(skipped)
-        warning = _skipped_unreadable_warning(skipped, _omitted_diagnostic_count(diagnostics)) if skipped else None
+        skip = _skipped_fields(diagnostics) if _is_permission_only_error(diagnostics) \
+            else {"skipped_paths": [], "skipped_omitted": 0}
+        permission_only = result.exit_code == 2 and bool(skip["skipped_paths"])
+        warning = _prepend_skipped_paths_warning(skip, None)
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
@@ -1255,11 +1273,11 @@ class SearchMixin:
                 limit_reason = limit_reason or directory_limit_reason
         if permission_only and not all_files:
             return SearchResult(files=[], total_count=0,
-                                warning=f"{warning} {_PERMISSION_SEARCH_HINT}")
+                                warning=f"{warning} {_PERMISSION_SEARCH_HINT}", **skip)
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
             truncated=len(all_files) > offset + limit or bool(limit_reason),
-            limit_reason=limit_reason, warning=warning)
+            limit_reason=limit_reason, warning=warning, **skip)
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
