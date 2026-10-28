@@ -23,14 +23,18 @@ from hermes_cli import gateway_runtime, update_lock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _READER = r"""
-import sys, time
+import sys, threading
 sys.path.insert(0, sys.argv[1])
 from hermes_cli import update_lock
-root, seconds = sys.argv[2], float(sys.argv[3])
+root = sys.argv[2]
+stop = threading.Event()
+threading.Thread(target=lambda: (sys.stdin.readline(), stop.set()), daemon=True).start()
 print("ready", flush=True)
-end = time.monotonic() + seconds
-while time.monotonic() < end:
+probes = 0
+while not stop.is_set():
     update_lock.checkout_lock_held(root)
+    probes += 1
+print(probes, flush=True)
 """
 
 _HOLDER = r"""
@@ -66,7 +70,7 @@ def install(tmp_path, monkeypatch):
 
 
 def _assert_readers_never_fence(root: Path, home: Path) -> None:
-    readers = [_spawn(_READER, root, "6") for _ in range(2)]
+    readers = [_spawn(_READER, root) for _ in range(2)]
     try:
         for reader in readers:
             assert reader.stdout.readline().strip() == "ready"
@@ -75,10 +79,19 @@ def _assert_readers_never_fence(root: Path, home: Path) -> None:
         while time.monotonic() < end:
             polls += 1
             fenced += gateway_runtime._update_fenced({home})
+        # Both readers probed for the whole window: neither exited (or crashed) before the polls ended.
+        assert [reader.poll() for reader in readers] == [None, None]
+        for reader in readers:
+            reader.stdin.write("stop\n")
+            reader.stdin.flush()
+        probes = [int(reader.stdout.readline()) for reader in readers]
+        assert [reader.wait(timeout=30) for reader in readers] == [0, 0]
     finally:
         for reader in readers:
-            reader.kill()
-            reader.wait(timeout=30)
+            if reader.poll() is None:
+                reader.kill()
+                reader.wait(timeout=30)
+    assert min(probes) > 0
     assert fenced == 0, f"{fenced} of {polls} ensure polls read another reader's probe as an update"
 
     holder = _spawn(_HOLDER, root)
