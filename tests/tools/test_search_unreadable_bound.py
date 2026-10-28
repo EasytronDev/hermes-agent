@@ -76,3 +76,15 @@ def test_find_fallback_names_the_unreadable_dir(locked_tree, monkeypatch):
     assert result.error is None
     assert sorted(os.path.basename(p) for p in result.files) == [f"f{i}.log" for i in range(5)]
     assert f"Skipped 60 unreadable path(s) with restricted permissions: {locked_tree}/d" in (result.warning or "")
+
+
+def test_a_real_error_past_the_stderr_cap_is_not_read_as_permission_only(monkeypatch):
+    monkeypatch.setattr(file_operations_search, "_STDERR_RETAIN_BYTES", 1)
+    perm = [f"rg: /r/d{i}: Permission denied (os error 13)\n".encode() for i in range(5)]
+    lines = perm[:3] + [b"rg: /r/gone: No such file or directory (os error 2)\n"] + perm[3:]
+    chunks, omitted = [], [0]
+    file_operations_search._drain_stderr_capped(iter(lines), chunks, omitted)
+    text = b"".join(chunks).decode()
+    assert "No such file or directory" in text
+    assert omitted[0] == 4  # permission lines past the cap
+    assert not file_operations_search._is_permission_only_error(text)

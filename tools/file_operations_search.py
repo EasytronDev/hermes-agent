@@ -300,10 +300,18 @@ def _find_exit_verdict(exit_code: int, raw_files: list[str], diagnostics: list[s
 def _drain_stderr_capped(pipe, chunks: list[bytes], omitted: list[int]) -> None:
     """Read ``pipe`` to EOF (rg must never block on a full stderr pipe) but keep only the
     first ``_STDERR_RETAIN_BYTES``; the first line is always kept so a lone huge diagnostic
-    still names the failure. ``omitted[0]`` counts the dropped lines."""
+    still names the failure. ``omitted[0]`` counts the dropped lines. Past the cap the first
+    non-permission line is still kept, so a real failure behind a flood of permission
+    errors is never classified as a permission-only partial success."""
     kept = 0
+    kept_other = False
     for raw in pipe or ():
         if chunks and kept + len(raw) > _STDERR_RETAIN_BYTES:
+            line = raw.decode("utf-8", "replace").strip()
+            if not kept_other and line and not _PERMISSION_DENIED_RE.match(line):
+                chunks.append(raw)
+                kept_other = True
+                continue
             omitted[0] += 1
             continue
         chunks.append(raw)
