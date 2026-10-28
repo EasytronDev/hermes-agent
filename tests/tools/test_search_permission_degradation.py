@@ -249,8 +249,9 @@ def test_file_search_permission_degrade_keeps_timeout_limit_reason():
 # --- content search --------------------------------------------------------------
 
 
-def test_content_search_with_unreadable_dir_returns_partial_matches():
-    output = EACCES_DIR + "/repo/a.py:3:needle\n"
+@pytest.mark.parametrize("other", ["", "rg: /repo/gone: No such file or directory (os error 2)\n"])
+def test_content_search_with_unreadable_dir_returns_partial_matches(other):
+    output = EACCES_DIR + other + "/repo/a.py:3:needle\n"
     env = RecordingEnvironment(rg_output=output, rg_code=2)
 
     result = ShellFileOperations(env).search(
@@ -261,6 +262,8 @@ def test_content_search_with_unreadable_dir_returns_partial_matches():
         ("/repo/a.py", 3, "needle")]
     assert "unreadable path" in (result.warning or "")
     assert "/srv/locked" in (result.warning or "")
+    if other:
+        assert other.strip() in (result.warning or "")
 
 
 class CountEnvironment(RecordingEnvironment):
@@ -361,9 +364,14 @@ def test_grep_content_search_non_permission_error_still_fails_closed():
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])
-def test_find_exit1_with_payload_degrades_to_partial(order):
+@pytest.mark.parametrize("diagnostic,expected", [
+    ("", ["unreadable", "partial"]),
+    ("find: '/narrow/gone': No such file or directory\n",
+     ["Some paths could not be read: find: '/narrow/gone': No such file or directory"]),
+])
+def test_find_exit1_with_payload_degrades_to_partial(order, diagnostic, expected):
     output = "/narrow/partial.py\n" if order == "discovery" else "10 /narrow/partial.py\n"
-    env = GrepOnlyEnvironment(rg_output=output, rg_code=1)
+    env = GrepOnlyEnvironment(rg_output=diagnostic + output, rg_code=1)
 
     result = ShellFileOperations(env).search(
         "*.py", path="/narrow", target="files", order=order)
@@ -371,9 +379,10 @@ def test_find_exit1_with_payload_degrades_to_partial(order):
     assert result.error is None
     assert result.files == ["/narrow/partial.py"]
     assert result.total_count == 1
-    assert result.warning is not None
-    assert "unreadable" in (result.warning or "")
-    assert "partial" in (result.warning or "")
+    for text in expected:
+        assert text in (result.warning or "")
+    if diagnostic:
+        assert "permission" not in (result.warning or "").lower()
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])

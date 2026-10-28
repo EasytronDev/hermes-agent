@@ -172,18 +172,35 @@ _PERMISSION_DENIED_RE = re.compile(
 
 _FIND_QUOTES_RE = re.compile(r"^['\u2018]|['\u2019]$")
 
+# The native rg runner keeps at most this much stderr (a huge tree of unreadable dirs
+# would otherwise be held in memory whole) and appends one tally line for the rest.
+_STDERR_RETAIN_BYTES = 64 * 1024
+_OMITTED_DIAGNOSTICS_RE = re.compile(r"^rg: \.\.\. (\d+) more diagnostic line\(s\) omitted$")
+
+
+def _omitted_diagnostics_line(count: int) -> str:
+    return f"rg: ... {count} more diagnostic line(s) omitted"
+
+
+def _omitted_diagnostic_count(diagnostics: str) -> int:
+    return sum(int(m.group(1)) for line in diagnostics.splitlines()
+               if (m := _OMITTED_DIAGNOSTICS_RE.match(line.strip())))
+
 
 def _is_permission_only_error(diagnostics: str) -> bool:
     """True when every diagnostic line reports an unreadable path (rg or grep).
     That is a partial-success condition — the tool still emits results for the
-    readable remainder — not a broken invocation like a bad glob or regex."""
-    lines = [line.strip() for line in diagnostics.splitlines() if line.strip()]
+    readable remainder — not a broken invocation like a bad glob or regex. The
+    native runner's omitted-lines tally is judged by the lines it kept."""
+    lines = [line.strip() for line in diagnostics.splitlines()
+             if line.strip() and not _OMITTED_DIAGNOSTICS_RE.match(line.strip())]
     return bool(lines) and all(_PERMISSION_DENIED_RE.match(line) for line in lines)
 
 
 def _extract_unreadable_paths(diagnostics: str) -> list[str]:
     """Paths reported unreadable by rg or grep, deduplicated in first-seen order."""
     paths: list[str] = []
+    seen: set[str] = set()
     for line in diagnostics.splitlines():
         match = _PERMISSION_DENIED_RE.match(line.strip())
         if not match:
@@ -191,20 +208,22 @@ def _extract_unreadable_paths(diagnostics: str) -> list[str]:
         path = match.group("path").strip()
         if match.group("tool") == "find":
             path = _FIND_QUOTES_RE.sub("", path)
-        if path and path not in paths:
+        if path and path not in seen:
+            seen.add(path)
             paths.append(path)
     return paths
 
 
-def _compact_unreadable_paths(paths: list[str], keep: int = 3) -> str:
+def _compact_unreadable_paths(paths: list[str], keep: int = 3, omitted: int = 0) -> str:
     shown = ", ".join(paths[:keep])
-    extra = len(paths) - keep
+    extra = max(len(paths) - keep, 0) + omitted
     return shown + (f" (+{extra} more)" if extra > 0 else "")
 
 
-def _skipped_unreadable_warning(paths: list[str]) -> str:
-    return ("Skipped " + str(len(paths)) + " unreadable path(s) with restricted "
-            "permissions: " + _compact_unreadable_paths(paths)
+def _skipped_unreadable_warning(paths: list[str], omitted: int = 0) -> str:
+    """``omitted`` counts diagnostics the native runner dropped past its retention cap."""
+    return ("Skipped " + str(len(paths) + omitted) + " unreadable path(s) with restricted "
+            "permissions: " + _compact_unreadable_paths(paths, omitted=omitted)
             + ". Results may be incomplete; fix permissions or run as a user that "
             "can read them to include them.")
 
@@ -214,7 +233,7 @@ def _prepend_skipped_paths_warning(diagnostics: str, existing: Optional[str]) ->
     paths = _extract_unreadable_paths(diagnostics)
     if not paths:
         return existing
-    warning = _skipped_unreadable_warning(paths)
+    warning = _skipped_unreadable_warning(paths, _omitted_diagnostic_count(diagnostics))
     return warning if not existing else f"{warning} {existing}"
 
 
@@ -268,8 +287,27 @@ def _find_exit_verdict(exit_code: int, raw_files: list[str], diagnostics: list[s
             return SearchResult(error=_FIND_MODIFIED_ORDER_ERROR), None
         detail = f": {diagnostics[0]}" if diagnostics else "."
         return SearchResult(error=f"File search failed while running bounded find traversal{detail}"), None
+    # A non-permission diagnostic (a dir removed mid-walk) must not be reported as a permission
+    # problem: name it, plus any permission skips, so the user chases the real cause.
+    other = next((d.strip() for d in diagnostics if d.strip() and not _PERMISSION_DENIED_RE.match(d.strip())), None)
+    if other:
+        return None, f"Some paths could not be read: {other}. Results may be incomplete." + (
+            f" {warning}" if warning else "")
     return None, warning or ("find traversal skipped one or more unreadable paths (restricted "
                              "permissions); results are partial.")
+
+
+def _drain_stderr_capped(pipe, chunks: list[bytes], omitted: list[int]) -> None:
+    """Read ``pipe`` to EOF (rg must never block on a full stderr pipe) but keep only the
+    first ``_STDERR_RETAIN_BYTES``; the first line is always kept so a lone huge diagnostic
+    still names the failure. ``omitted[0]`` counts the dropped lines."""
+    kept = 0
+    for raw in pipe or ():
+        if chunks and kept + len(raw) > _STDERR_RETAIN_BYTES:
+            omitted[0] += 1
+            continue
+        chunks.append(raw)
+        kept += len(raw)
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
@@ -346,9 +384,15 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
             return SearchResult(total_count=0, warning=warning)
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
     skipped_warning = _prepend_skipped_paths_warning(diagnostics, None)
-    tool_errors = [ln.strip() for ln in diagnostics.splitlines() if ln.lstrip().startswith(("rg: ", "grep: "))]
-    if not skipped_warning and result.exit_code == 2 and tool_errors:
-        skipped_warning = f"The search reported errors for some paths; results may be incomplete ({tool_errors[0]})."
+    # A non-permission error beside the skips (a path removed mid-search) is named too, not
+    # folded into the permission warning.
+    other_errors = [ln.strip() for ln in diagnostics.splitlines()
+                    if ln.lstrip().startswith(("rg: ", "grep: "))
+                    and not _PERMISSION_DENIED_RE.match(ln.strip())
+                    and not _OMITTED_DIAGNOSTICS_RE.match(ln.strip())]
+    if result.exit_code == 2 and other_errors:
+        error_warning = f"The search reported errors for some paths; results may be incomplete ({other_errors[0]})."
+        skipped_warning = f"{error_warning} {skipped_warning}" if skipped_warning else error_warning
     if skipped_warning:
         warning = skipped_warning if not warning else f"{skipped_warning} {warning}"
     lines = [ln for ln in payload.strip().split('\n') if ln]
@@ -531,11 +575,12 @@ class SearchMixin:
         drainer = threading.Thread(target=_drain, daemon=True)
         drainer.start()
         err_chunks: list[bytes] = []
+        err_omitted = [0]
         err_drainer = None
         if merge_stderr:
             err_pipe = proc.stderr
             err_drainer = threading.Thread(  # health: allow HX012 -- pipe drainer, reads no profile-scoped state
-                target=lambda: err_chunks.extend(err_pipe or ()), daemon=True)
+                target=_drain_stderr_capped, args=(err_pipe, err_chunks, err_omitted), daemon=True)
             err_drainer.start()
         deadline = time.monotonic() + timeout
         exit_code: Optional[int] = None
@@ -559,7 +604,10 @@ class SearchMixin:
             err_drainer.join()
             if proc.stderr is not None:
                 proc.stderr.close()
-            stdout = b"".join(err_chunks).decode("utf-8", errors="replace") + stdout
+            err_text = b"".join(err_chunks).decode("utf-8", errors="replace")
+            if err_omitted[0]:
+                err_text = err_text.rstrip("\n") + "\n" + _omitted_diagnostics_line(err_omitted[0]) + "\n"
+            stdout = err_text + stdout
         if exit_code == 124:
             return ExecuteResult(stdout=stdout + f"\n[Command timed out after {timeout}s]", exit_code=124)
         if exit_code == 130:
@@ -1125,7 +1173,7 @@ class SearchMixin:
         skipped = _extract_unreadable_paths(diagnostics) \
             if _is_permission_only_error(diagnostics) else []
         permission_only = result.exit_code == 2 and bool(skipped)
-        warning = _skipped_unreadable_warning(skipped) if skipped else None
+        warning = _skipped_unreadable_warning(skipped, _omitted_diagnostic_count(diagnostics)) if skipped else None
         if scoped_common:
             all_files = [
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))

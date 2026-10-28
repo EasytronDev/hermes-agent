@@ -11,6 +11,7 @@ import shutil
 
 import pytest
 
+from tools import file_operations_search
 from tools.environments.local import LocalEnvironment
 from tools.file_operations import ShellFileOperations
 
@@ -41,17 +42,30 @@ def locked_tree(tmp_path):
     ("content", {"output_mode": "files_only"}),
     ("content", {}),
 ])
-def test_many_unreadable_dirs_do_not_eat_the_result_budget(locked_tree, target, kwargs):
+def test_many_unreadable_dirs_do_not_eat_the_result_budget(locked_tree, target, kwargs, monkeypatch):
     if not shutil.which("rg"):
         pytest.skip("needs ripgrep")
     ops = ShellFileOperations(LocalEnvironment(cwd=str(locked_tree)), cwd=str(locked_tree))
     pattern = "*.log" if target == "files" else "needle"
-    result = ops.search(pattern, path=str(locked_tree), target=target, limit=3, **kwargs)
-    assert result.error is None
-    found = result.files or [m.path for m in result.matches]
+
+    # Bounded run: rg is stopped at the limit, so how many skips it reported first
+    # depends on traversal order; only the budget and the warning's presence are fixed.
+    bounded = ops.search(pattern, path=str(locked_tree), target=target, limit=3, **kwargs)
+    assert bounded.error is None
+    found = bounded.files or [m.path for m in bounded.matches]
     assert len(found) == 3
     assert all(p.endswith(".log") for p in found)
-    assert "Skipped 60 unreadable path(s)" in (result.warning or "")
+    assert "unreadable path(s) with restricted permissions" in (bounded.warning or "")
+
+    # Full traversal under a one-line stderr cap: every skip is still counted, the
+    # ones past the cap as "+N more".
+    monkeypatch.setattr(file_operations_search, "_STDERR_RETAIN_BYTES", 1)
+    full = ops.search(pattern, path=str(locked_tree), target=target, limit=50, **kwargs)
+    assert full.error is None
+    found = full.files or [m.path for m in full.matches]
+    assert sorted(os.path.basename(p) for p in found) == [f"f{i}.log" for i in range(5)]
+    assert "Skipped 60 unreadable path(s)" in (full.warning or "")
+    assert "(+59 more)" in (full.warning or "")
 
 
 def test_find_fallback_names_the_unreadable_dir(locked_tree, monkeypatch):
