@@ -5695,20 +5695,6 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                  + len(self._approval_mention_content() or "") + 1)
         return max(0, self.MAX_MESSAGE_LENGTH - fixed)
 
-    async def expire_exec_approval(self, chat_id: str, message_id: str, content: str) -> SendResult:
-        """Remove Discord's components when the backend approval expires."""
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        try:
-            channel = await self._resolve_channel(chat_id)
-            msg = channel.get_partial_message(int(message_id))
-            content = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)[0]
-            await msg.edit(content=content, view=None)
-            return SendResult(success=True, message_id=message_id)
-        except Exception as exc:
-            logger.warning("[Discord] Failed to expire approval card: %s", exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
-
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Send an approval with content as its canonical payload and an embed for state."""
         require_admin, admin_user_ids = _resolve_exec_approval_admin_gate(getattr(self.config, "extra", None))
