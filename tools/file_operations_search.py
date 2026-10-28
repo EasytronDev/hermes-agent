@@ -148,7 +148,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
         if not line.strip():
             continue
         # Prefix check first: a match path can contain "-<digit>" (".../pytest-686/...").
-        if line.lstrip().startswith(("rg: ", "grep: ")):
+        if line.lstrip().startswith(("rg: ", "grep: ", "find: ")):
             diagnostics.append(line)
         elif line == "--" or _SEARCH_OUTPUT_RE.match(line):
             payload.append(line)
@@ -161,10 +161,15 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 #   rg:   ``rg: <path>: Permission denied (os error 13)``
 #   rg modified-sort walk: ``rg: <path>: IO error for operation on <path>: Permission denied (os error 13)``
 #   grep: ``grep: <path>: Permission denied`` (no ``(os error N)`` suffix)
+#   find: ``find: '<path>': Permission denied`` (pruned grep lane; GNU find quotes the
+#         path with ASCII ``'`` or, in a UTF-8 locale, with typographic quotes)
 # The ``(os error N)`` suffix is ripgrep's Rust io::Error spelling, so it is optional.
 _PERMISSION_DENIED_RE = re.compile(
-    r"^(?:(?:rg|grep): )?(?P<path>.+?): "
+    r"^(?:(?P<tool>rg|grep|find): )?(?P<path>.+?): "
     r"(?:IO error for operation on .+?: )?Permission denied(?: \(os error \d+\))?$")
+
+
+_FIND_QUOTES_RE = re.compile(r"^['\u2018]|['\u2019]$")
 
 
 def _is_permission_only_error(diagnostics: str) -> bool:
@@ -183,6 +188,8 @@ def _extract_unreadable_paths(diagnostics: str) -> list[str]:
         if not match:
             continue
         path = match.group("path").strip()
+        if match.group("tool") == "find":
+            path = _FIND_QUOTES_RE.sub("", path)
         if path and path not in paths:
             paths.append(path)
     return paths
@@ -1256,5 +1263,8 @@ class SearchMixin:
         find_parts.extend([self._hidden_prune_expr([q_root]), "-o", "-type f"])
         if file_glob:
             find_parts.extend(["-name", self._escape_shell_arg(file_glob)])
-        find_parts.extend(["-exec", *grep_parts, "{}", "+", "2>/dev/null"])
+        # stderr stays attached (``_exec`` merges it into stdout): find's
+        # ``Permission denied`` lines must reach the parser so an unreadable
+        # subtree beside a readable match is reported, not silently dropped.
+        find_parts.extend(["-exec", *grep_parts, "{}", "+"])
         return self._run_search_pipeline(find_parts, output_mode, limit, offset, context, line_cap=True)
