@@ -20,11 +20,14 @@ class MissingReceipt(ValueError):
 def validate_identity(tag: str, commit: str, name: str) -> None:
     # Stable attempts stage and fetch under their attempt ref, so the receipt
     # identity admits rc.N-vX.Y.Z beside plain vX.Y.Z and canary.<stamp>-vX.Y.Z tags.
-    from hermes_cli.update_channel import release_version
+    # A commit claim (commit.<stamp>-vX.Y.Z) stages under its own claim archive too;
+    # its version is no release version, which is why it never reaches a feed.
+    from hermes_cli.update_channel import is_commit_tag, release_version
     from scripts.releases.versioning import parse_attempt_ref
 
     if (not isinstance(tag, str)
-            or not (is_release_version(release_version(tag) or "") or parse_attempt_ref(tag))
+            or not (is_release_version(release_version(tag) or "") or parse_attempt_ref(tag)
+                    or is_commit_tag(tag))
             or not re.fullmatch(r"[a-f0-9]{40}", commit or "")
             or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name or "")):
         raise ValueError("Invalid release handoff identity")
