@@ -295,23 +295,81 @@ export async function materializeDesktopHalf(
     }
   }
 
-  await publishDesktopTree(sourceDir, target, staged => writeDesktopHalfMarker(staged, marker))
+  // A package folder symlinked in by hand is the user's own development checkout and is copied as it
+  // stands; an installed package is checked like a fresh clone (a link inside it publishes host files).
+  await publishDesktopTree({ dir: sourceDir, plainWithin: linked ? null : packageDir }, target, staged =>
+    writeDesktopHalfMarker(staged, marker)
+  )
 
   return target
 }
 
-/** Copy `sourceDir` to `target` through a staging sibling (`<parent>/.<name>.staging-*`)
- *  and rename the finished tree into place. `finalize` runs on the staged tree
- *  before publication, so a marker is never missing from a published folder.
+// The same cap the Webapp's host-side desktop install applies to the copied tree.
+const DESKTOP_TREE_MAX_BYTES = 64 * 1024 * 1024
+
+/** What `publishDesktopTree` copies. `plainWithin` names the clone or installed package the tree must
+ *  stay inside as plain files and folders; `null` only for a development checkout the user linked in. */
+export interface DesktopTreeSource {
+  dir: string
+  plainWithin: null | string
+}
+
+/** Refuse a desktop tree that reaches outside its package or is too big to copy. A symlink anywhere on
+ *  the way to it, or inside it, would publish whatever it points at on this machine (or a dangling link
+ *  into a deleted clone) as part of the plugin, so the tree must be plain files and folders. */
+async function assertPlainDesktopTree(root: string, sourceDir: string): Promise<void> {
+  const realRoot = await fs.promises.realpath(root)
+
+  if ((await fs.promises.realpath(sourceDir)) !== path.join(realRoot, path.relative(root, sourceDir))) {
+    throw new Error('The desktop plugin folder is a symbolic link; it is not installed.')
+  }
+
+  let total = 0
+  const pending = [sourceDir]
+
+  while (pending.length > 0) {
+    const dir = pending.pop()!
+
+    for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+
+      if (entry.isSymbolicLink()) {
+        throw new Error(
+          `The desktop plugin contains a symbolic link (${path.relative(sourceDir, full)}); it is not installed.`
+        )
+      }
+
+      if (entry.isDirectory()) {
+        pending.push(full)
+      } else {
+        total += (await fs.promises.lstat(full)).size
+
+        if (total > DESKTOP_TREE_MAX_BYTES) {
+          throw new Error(`The desktop plugin is larger than ${DESKTOP_TREE_MAX_BYTES / (1024 * 1024)} MB.`)
+        }
+      }
+    }
+  }
+}
+
+/** Copy `source.dir` to `target` through a staging sibling (`<parent>/.<name>.staging-*`)
+ *  and rename the finished tree into place. Every route that publishes a desktop tree (git install,
+ *  package reconcile) comes through here, so the plain-tree check runs once for all of them, before
+ *  anything is staged. `finalize` runs on the staged tree before publication, so a marker is never
+ *  missing from a published folder.
  *  Directory replacement is not atomic on every platform Electron supports, but
  *  the complete copy exists before the old one is removed, so a failure leaves
  *  either the old folder or none — never a partial, marker-less one that a
  *  later pass would mistake for a manual install (#112450). */
 export async function publishDesktopTree(
-  sourceDir: string,
+  source: DesktopTreeSource,
   target: string,
   finalize?: (staged: string) => Promise<void>
 ): Promise<void> {
+  if (source.plainWithin !== null) {
+    await assertPlainDesktopTree(source.plainWithin, source.dir)
+  }
+
   const parent = path.dirname(target)
   const name = path.basename(target)
 
@@ -320,7 +378,7 @@ export async function publishDesktopTree(
   const staged = path.join(stagingRoot, name)
 
   try {
-    await fs.promises.cp(sourceDir, staged, { force: true, recursive: true })
+    await fs.promises.cp(source.dir, staged, { force: true, recursive: true })
     await finalize?.(staged)
     // rename() refuses to replace a non-empty directory, so the old copy goes first.
     await fs.promises.rm(target, { force: true, recursive: true })
@@ -383,7 +441,8 @@ async function reconcilePass(hermesHome: string, appRoot: string): Promise<strin
         // One package the app cannot read (Windows ACL EPERM on lstat/copy, a
         // mode-000 folder) must not reject the whole reconcile — the root would
         // never resolve and EVERY desktop plugin would silently stop loading.
-        console.warn(`[desktop-plugins] skipping unreadable package ${name}: ${String(error)}`)
+        // A desktop half refused by the plain-tree check lands here too.
+        console.warn(`[desktop-plugins] skipping package ${name}: ${String(error)}`)
 
         continue
       }
