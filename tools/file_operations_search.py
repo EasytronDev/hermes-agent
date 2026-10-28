@@ -268,7 +268,11 @@ def _merge_child_warnings(children: list[SearchResult], has_results: bool) -> li
         warning, sentence = child.warning, _skipped_sentence(child)
         if sentence:
             total += len(child.skipped_paths) + child.skipped_omitted
-            shown.extend(p for p in child.skipped_paths if p not in shown)
+            for path in child.skipped_paths:  # only three are displayed; never scan thousands
+                if len(shown) >= 3:
+                    break
+                if path not in shown:
+                    shown.append(path)
             warning = warning.replace(sentence, "\0")
         for piece in warning.split("\0"):
             piece = piece.strip()
@@ -278,8 +282,7 @@ def _merge_child_warnings(children: list[SearchResult], has_results: bool) -> li
                 rest.append(piece)
     if not total:
         return rest
-    kept = shown[:3]
-    sentence = _skipped_unreadable_warning(kept, max(total - len(kept), 0))
+    sentence = _skipped_unreadable_warning(shown, max(total - len(shown), 0))
     return [sentence, *rest]
 
 
