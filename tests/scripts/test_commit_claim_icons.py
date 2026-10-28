@@ -27,7 +27,7 @@ def render(out, env):
     return subprocess.run(
         [sys.executable, "-I", str(ROOT / "scripts/generate_icons.py"),
          "--source", str(ROOT), "--out", str(out)],
-        env=env, text=True, capture_output=True, timeout=180,
+        env=env, text=True, capture_output=True, timeout=180, check=False,
     )
 
 
