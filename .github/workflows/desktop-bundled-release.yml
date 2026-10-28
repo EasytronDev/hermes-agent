@@ -1112,7 +1112,9 @@ jobs:
           RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
         # Per-arch feed inputs stay in the tag archive until both legs pass.
         run: |
-          args=(--include '*.dmg' --include '*.zip' --include '*.blockmap' --include '*-mac.yml')
+          args=(--include '*.dmg' --include '*.zip' --include '*.blockmap')
+          # Commit claims have no updater; their packager emits no feed yml.
+          if [[ "$HERMES_PAYLOAD_TAG" != commit.* ]]; then args+=(--include '*-mac.yml'); fi
           if [ "$RELEASE_PHASE" = candidate ] || { [ "$HERMES_DESKTOP_VARIANT" = bundled ] && [[ "$HERMES_PAYLOAD_TAG" == canary.* ]]; }; then
             python -m scripts.bundles.release_artifacts record --platform macos --arch "${TARGET##*-}" \
               --root apps/desktop/release --tag "$HERMES_PAYLOAD_TAG" --commit "$RELEASE_COMMIT" \
