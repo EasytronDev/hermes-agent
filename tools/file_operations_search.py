@@ -4,6 +4,7 @@
 (no I/O).
 """
 
+import contextlib
 import os
 import posixpath
 import re
@@ -508,6 +509,12 @@ class SearchMixin:
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
+        # Record the group at spawn, as LocalEnvironment._run_bash does: rg can exit between the
+        # poll and the kill below, and on macOS a not-yet-reaped child has no pgid any more.
+        with contextlib.suppress(ProcessLookupError):
+            proc._hermes_pgid = os.getpgid(proc.pid)
+            from gateway.status import get_process_start_time
+            proc._hermes_pgid_start = get_process_start_time(proc.pid)
 
         # Drain on a thread so a silent rg (huge tree, no hits yet) cannot pin the
         # caller past the deadline or past a /stop; the waiter below owns both.
