@@ -9,7 +9,9 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import contextlib
 import json
+import sqlite3
 import time
 from typing import Any
 from typing import Optional
@@ -143,9 +145,141 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
+class LiveBoardTaskError(ValueError):
+    """``remove_board`` refused: the board still holds a card in flight — a task
+    ``running`` under a live worker claim. Removing the board would destroy
+    that card while its worker keeps executing against it. A ``ValueError`` so
+    the CLI renders it as a clean operator message (and exits non-zero) instead
+    of a traceback, the same way ``kanban_db.LiveClaimError`` fences
+    ``complete_task``."""
+
+    def __init__(self, slug: str, task_ids: list[str], action: str, remedy: str):
+        self.slug = slug
+        self.task_ids = list(task_ids)
+        self.action = action
+        super().__init__(
+            f"board {slug!r} has {len(task_ids)} task(s) running "
+            f"({', '.join(task_ids)}) — refusing to {action}. {remedy}"
+        )
+
+
+def _board_live_task_ids(db_path: Path) -> list[str]:
+    """Task ids on the board that a live worker is still running.
+
+    A board whose card is in flight must not be destroyed: the dispatcher has
+    already spawned a worker against it, and the worker keeps executing against
+    a card that no longer exists in any database. Measured incidents
+    (``t_ec405bea``, ``t_65f193a1``, ``t_d74a3b5e``, ``t_f180ff45`` across
+    ``e2e-ciclo-test`` and ``e2e-fixa2-test``) destroyed in-flight cards this
+    way.
+
+    Liveness mirrors ``kanban_db._claim_is_live`` — a ``running`` task whose
+    ``worker_pid`` still resolves to the fingerprinted process. A claim whose
+    worker is gone protects no run and does NOT block the removal; otherwise a
+    crashed worker would wedge its board forever.
+
+    Both the task row and its current run row are consulted:
+
+    * ``tasks.status = 'running'`` with a live worker — the normal in-flight card.
+    * the task's CURRENT run (``tasks.current_run_id``) still ``running`` with a
+      live worker — the case where the task row was archived (or flipped)
+      while its run stayed open. The worker is still executing, so the board
+      still holds live work.
+
+    A run row that is no longer the task's ``current_run_id`` was superseded
+    (reclaim / re-dispatch): no worker is executing it, so it must NOT block
+    the removal.
+
+    Read strictly read-only and defensively: the board's DB may be missing,
+    empty, mid-WAL or locked. A board we cannot inspect is NOT assumed safe to
+    destroy — an unreadable DB yields an empty list only when the file truly
+    does not exist; any other failure raises, so the caller refuses instead of
+    destroying a board it could not verify.
+    """
+    try:
+        if not db_path.exists() or db_path.stat().st_size == 0:
+            return []
+    except OSError:
+        return []
+
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        # Could not open read-only (locked / corrupt / permissions). Refuse.
+        raise LiveBoardTaskError(
+            slug=db_path.parent.name,
+            task_ids=[],
+            action="inspect",
+            remedy=(
+                f"the board database could not be opened read-only ({exc}); "
+                "refusing to remove a board whose live tasks could not be verified."
+            ),
+        )
+    try:
+        conn.row_factory = sqlite3.Row
+        live: dict[str, str] = {}
+
+        def _collect(sql: str, id_col: str) -> None:
+            try:
+                rows = conn.execute(sql).fetchall()
+            except sqlite3.DatabaseError:
+                # Table/column missing (legacy board) — that source has no
+                # live work to protect.
+                return
+            for row in rows:
+                task_id = row[id_col]
+                if not task_id:
+                    continue
+                pid = row["worker_pid"]
+                started_at = row["worker_started_at"]
+                if not pid:
+                    continue
+                try:
+                    alive = _kb._worker_alive(pid, started_at)
+                except Exception:
+                    alive = False
+                if alive:
+                    live.setdefault(task_id, str(pid))
+
+        # The task row: the normal in-flight card (``running`` + live worker).
+        _collect(
+            "SELECT id AS task_id, worker_pid, worker_started_at FROM tasks "
+            "WHERE status = 'running' AND worker_pid IS NOT NULL",
+            "task_id",
+        )
+        # The run row, but ONLY the run the task still points at. A run left
+        # ``running`` that is no longer the task's ``current_run_id`` was
+        # superseded (reclaim / re-dispatch): no worker is executing it, and
+        # honouring it would wedge the board forever behind a dead run.
+        _collect(
+            "SELECT r.task_id AS task_id, r.worker_pid, r.worker_started_at "
+            "FROM task_runs r JOIN tasks t ON t.current_run_id = r.id "
+            "WHERE r.status = 'running' AND r.worker_pid IS NOT NULL",
+            "task_id",
+        )
+        return sorted(live)
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(
+            f"cannot inspect board database {db_path}: refusing to remove a "
+            f"board whose live tasks could not be verified ({exc})"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``.
+
+    A board with a card in flight — a task still ``running`` under a live
+    worker claim — is REFUSED, for both archive and hard delete. Removing it
+    would destroy the card the dispatcher just spawned a worker for, while that
+    worker keeps running against a task that no longer exists. The refusal
+    names the offending task ids so the operator can wait for them to finish
+    (or archive the board afterwards).
+    """
     _kb._assert_not_delegated_child_mutation()
     normed = _kb._require_slug(slug)
     if normed == _kb.DEFAULT_BOARD:
@@ -153,6 +287,22 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     d = _kb.board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
+
+    # Refuse BEFORE any destructive step: archiving also takes the whole board
+    # (and its DB) out of the dispatcher's reach, so it needs the same fence.
+    live_ids = _board_live_task_ids(d / "kanban.db")
+    if live_ids:
+        action = "archive" if archive else "delete"
+        # Message text matches the reference guard (keyhc-e2e/fake_kanban.py):
+        # same semantics, same wording. The archive path cannot advise
+        # archiving (that IS the operation being refused), so it points at
+        # "try again" instead.
+        remedy = (
+            "Wait for them to reach a terminal state and try again."
+            if archive
+            else "Wait for them to reach a terminal state or archive the board instead."
+        )
+        raise LiveBoardTaskError(normed, live_ids, action, remedy)
 
     # If the user removed the currently-active board, revert to default.
     if _kb.get_current_board() == normed:
