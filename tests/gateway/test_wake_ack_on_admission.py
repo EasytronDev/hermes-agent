@@ -147,18 +147,22 @@ def test_the_blocking_route_is_gone(monkeypatch):
 async def test_a_slow_card_does_not_delay_another_cards_notification():
     """THE REGRESSION: a slow card must not hold up a different card's wake.
 
-    A card whose agent turn is slow (``/v1/chat/completions`` keeps the request
-    open for the whole turn) runs FIRST in the notifier's serial delivery loop.
-    The card that finishes right after it must still be delivered promptly.
+    A card whose agent turn is slow runs FIRST in the notifier's serial delivery
+    loop. The card that finishes right after it must still be delivered promptly.
 
     Before the fix the second delivery waited for the first turn to finish: the
     self-post blocked the notifier's ``for d in deliveries: await ...`` loop for
     the whole turn (up to ``WAKE_TURN_TIMEOUT_SECONDS`` = 600 s), and the second
     card's notification waited behind it -- 82.2 min on the live gateway.
+
+    Both wake shapes are exercised, because they took different routes before the
+    fix: the KEYED one (``/v1/runs``) and the UNKEYED one
+    (``/v1/chat/completions``, which holds the request open for the whole turn).
+    The unkeyed shape is the one the watch-pattern notification path used.
     """
     from aiohttp import web
 
-    state = {"slow_turn_finished": False, "admissions": []}
+    state = {"slow_turn_finished": False, "admissions": [], "routes": []}
     admitted = {}
     gate = asyncio.Event()
 
@@ -166,6 +170,7 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
         """Mimic /v1/runs: admit the turn, answer 202, run the turn in background."""
         key = request.headers.get("Idempotency-Key")
         body = await request.json()
+        state["routes"].append("runs")
         if key and key in admitted:
             return web.json_response({"run_id": admitted[key], "status": "queued",
                                       "replayed": True},
@@ -187,6 +192,7 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
 
     async def _chat_completions(request):
         """Mimic /v1/chat/completions: hold the request open for the whole turn."""
+        state["routes"].append("chat_completions")
         state["admissions"].append({"input": (await request.json())["messages"][0]["content"]})
         await gate.wait()
         state["slow_turn_finished"] = True
@@ -206,42 +212,67 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
     wake_mod.WAKE_TURN_TIMEOUT_SECONDS = 30.0
     wake_mod._RETRY_DELAYS_SECONDS = (0.01, 0.01, 0.01)
     adapter = _Adapter(host="127.0.0.1", port=port, key="secret")
-    try:
-        # The SLOW card is delivered first (the notifier's loop is serial).
-        started = time.monotonic()
-        slow = asyncio.create_task(wake_mod._self_post_chat_completion(
-            adapter, text="[kanban] slow card", session_id="api_server:webui",
-            idempotency_key="kanban-wake:slow"))
 
-        # A DIFFERENT card finishes while the slow one is still in flight.
-        await asyncio.sleep(0.05)
-        delivered = await wake_mod._self_post_chat_completion(
-            adapter, text="[kanban] fast card", session_id="api_server:webui",
-            idempotency_key="kanban-wake:fast")
-        elapsed = time.monotonic() - started
+    # The SLOW card is delivered first (the notifier's loop is serial), for each
+    # wake shape. The UNKEYED shape is the one that blocked in production.
+    for label, key in (("keyed", "kanban-wake:slow"), ("unkeyed", None)):
+        state["slow_turn_finished"] = False
+        state["admissions"].clear()
+        state["routes"].clear()
+        gate = asyncio.Event()
+
+        slow = None
+        try:
+            started = time.monotonic()
+            slow = asyncio.create_task(wake_mod._self_post_chat_completion(
+                adapter, text=f"[wake] slow card ({label})", session_id="api_server:webui",
+                **({"idempotency_key": f"{key}:slow"} if key else {})))
+
+            # A DIFFERENT card finishes while the slow one is still in flight.
+            # It is a DIFFERENT event, so it gets its own key: a replayed key
+            # would (correctly) resolve to the earlier run instead of a new one.
+            await asyncio.sleep(0.05)
+            delivered = await wake_mod._self_post_chat_completion(
+                adapter, text=f"[wake] fast card ({label})", session_id="api_server:webui",
+                **({"idempotency_key": f"{key}:fast"} if key else {}))
+            elapsed = time.monotonic() - started
+            # Snapshot WHETHER the slow turn was still running AT DELIVERY TIME:
+            # that is the whole point, so it must be read before the gate opens.
+            slow_still_running = not state["slow_turn_finished"]
+        finally:
+            gate.set()
+            if slow is not None:
+                await slow
+            await runner.cleanup()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = runner.addresses[0][1]
+            adapter = _Adapter(host="127.0.0.1", port=port, key="secret")
 
         # The fast card's delivery must NOT wait for the slow turn to finish.
-        assert not state["slow_turn_finished"], (
-            "the fast card's delivery waited for the slow turn -- the session "
-            "queue was held behind the agent turn"
+        assert slow_still_running, (
+            f"the fast card's delivery ({label}) waited for the slow turn -- the "
+            "session queue was held behind the agent turn"
         )
         # The budget is the whole-turn one: the delay must not approach it.
         assert elapsed < 5.0, (
-            f"the second card's delivery took {elapsed:.1f}s -- it is waiting on "
-            "the agent turn instead of being ACKed at admission"
+            f"the second card's delivery ({label}) took {elapsed:.1f}s -- it is "
+            "waiting on the agent turn instead of being ACKed at admission"
         )
-        # And the delivery really happened.
+        # And the delivery really happened, exactly once each.
         assert delivered is None
         assert [a["input"] for a in state["admissions"]] == [
-            "[kanban] slow card", "[kanban] fast card",
-        ]
+            f"[wake] slow card ({label})", f"[wake] fast card ({label})",
+        ], f"delivery lost or duplicated for the {label} wake: {state['admissions']}"
+        assert "chat_completions" not in state["routes"], (
+            f"the {label} wake used the route that waits for the whole turn: "
+            f"{state['routes']}"
+        )
 
-        gate.set()
-        await slow
-    finally:
-        wake_mod.WAKE_TURN_TIMEOUT_SECONDS = old_timeout
-        wake_mod._RETRY_DELAYS_SECONDS = old_delays
-        await runner.cleanup()
+    wake_mod.WAKE_TURN_TIMEOUT_SECONDS = old_timeout
+    wake_mod._RETRY_DELAYS_SECONDS = old_delays
 
 
 @pytest.mark.asyncio
