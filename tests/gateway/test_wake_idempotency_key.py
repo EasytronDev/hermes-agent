@@ -132,14 +132,22 @@ def test_keyed_wake_posts_to_runs_with_the_key(monkeypatch):
     assert seen["json"]["session_id"] == "api_server:webui"
 
 
-def test_unkeyed_wake_keeps_the_chat_completions_path(monkeypatch):
-    """A wake without a key must not change transport."""
+def test_unkeyed_wake_also_acks_at_admission(monkeypatch):
+    """A wake without a key must still use the admitting route.
+
+    ACK-on-admission is the fix for the DELAY (a self-post on
+    ``/v1/chat/completions`` holds the notifier's serial delivery loop for the
+    whole agent turn), and it does not depend on the key: the key buys replay
+    protection for a caller with a stable batch identity, but the watch-pattern
+    notification path (``gateway/run_notifications.py``) has no such identity
+    and was therefore stuck on the blocking route.
+    """
     from gateway import wake as wake_mod
 
     seen = {}
 
     class _FakeResp:
-        status = 200
+        status = 202
 
         async def read(self):
             return b"{}"
@@ -181,9 +189,10 @@ def test_unkeyed_wake_keeps_the_chat_completions_path(monkeypatch):
         _Adapter(host="127.0.0.1", port=8642, key="secret"),
         text="[kanban] Task t_x completed.", session_id="api_server:webui"))
 
-    assert seen["url"].endswith("/v1/chat/completions")
+    assert seen["url"].endswith("/v1/runs")
     assert "Idempotency-Key" not in seen["headers"]
-    assert seen["json"]["stream"] is False
+    assert seen["json"]["input"] == "[kanban] Task t_x completed."
+    assert seen["json"]["session_id"] == "api_server:webui"
 
 
 # --- the replay -----------------------------------------------------------

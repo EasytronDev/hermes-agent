@@ -2,7 +2,9 @@
 (``supports_async_delivery``) get a synthetic ``MessageEvent(internal=True)`` via handle_message;
 stateless adapters (API server) would run that under a ``build_session_key()`` key that never
 matches the raw ``X-Hermes-Session-Id`` real turns use (invisible parallel session), so we self-POST
-``/v1/chat/completions`` with the raw id header to resume the REAL session. Exception:
+``/v1/runs`` with the raw id header to resume the REAL session. The self-POST is ACKed AT
+ADMISSION: ``/v1/runs`` admits the turn and answers 202 at once, so the wake counts as delivered
+when the admission exists and the caller's queue never waits on the agent turn. Exception:
 async-delegation completions: the CLIENT owns the next turn, so they are never self-POSTed as a
 new ``role=user`` prompt (could cross a pending human-confirmation gate); instead
 ``persist_delegation_delivery`` writes a durable DELIVERY row (``display_kind=
@@ -242,6 +244,16 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches.
 
+    The POST goes to ``/v1/runs``, which ADMITS the turn and answers 202 at once: the wake is
+    delivered when the admission is created, not when the agent turn finishes. Waiting for the
+    turn instead would hold the caller's queue for up to ``WAKE_TURN_TIMEOUT_SECONDS`` (600s) —
+    and the Kanban notifier delivers one card at a time, so that wait holds every other card's
+    notification in the same session (measured 2026-11-04: 82.2 min).
+
+    ``idempotency_key`` is OPTIONAL. When given, ``/v1/runs``'s durable Idempotency-Key store
+    replays the SAME run for an identical retry, so a client timeout does not start a second
+    agent turn in the woken session.
+
     ``profile`` (a served secondary under ``gateway.multiplex_profiles``) takes the IN-PROCESS
     route instead of the HTTP one: the shared listener's ``/p/<profile>/`` mirror authenticates
     with that profile's own ``API_SERVER_KEY`` — which a route-only profile legitimately does not
@@ -270,23 +282,32 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                            "server, so the wake cannot reach the target session")
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    # ACK ON ADMISSION: the wake is DELIVERED when the server admits the turn, not when the turn
+    # finishes. /v1/chat/completions holds the request open for the WHOLE turn, so a self-post on
+    # it blocks its caller for up to WAKE_TURN_TIMEOUT_SECONDS (600s). The notifier delivers ONE
+    # card at a time (gateway/kanban_watchers.py), so that block HOLDS THE WHOLE SESSION QUEUE:
+    # every other card's legitimate notification waits behind the slow one. Measured 2026-11-04:
+    # 8 consecutive 600s timeouts held the queue for 70.8 min, and a legitimate notification
+    # waited 82.2 min for its agent to wake.
+    #
+    # /v1/runs admits the turn and answers 202 at once (the turn runs in the background), so the
+    # self-post returns as soon as the wake is DELIVERED. The delivery no longer rides the agent
+    # turn's duration.
+    url = f"http://{host}:{port}/v1/runs"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
-               "messages": [{"role": "user", "content": text}], "stream": False}
+               "input": text, "session_id": session_id}
     if notification_category == "diagnostic":
         payload["hermes_notification_category"] = "diagnostic"
     if idempotency_key:
-        # /v1/chat/completions holds the request open for the WHOLE turn, and under session
-        # authority its idempotency cache is bypassed (``_run_idempotent`` only consults
-        # ``_idem_cache`` when ``session_authority is None``). So a client timeout followed by the
-        # retry loop below ran one agent turn per attempt: the same completion woke the same
-        # session N times. /v1/runs admits the turn and answers at once, and its durable
-        # Idempotency-Key store replays the SAME run for an identical retry instead of starting
-        # a second turn.
-        url = f"http://{host}:{port}/v1/runs"
+        # The durable Idempotency-Key store on /v1/runs replays the SAME run for an identical
+        # retry instead of starting a second turn: a client timeout followed by the retry loop
+        # below resumes THAT admission rather than waking the session again. (Under session
+        # authority /v1/chat/completions bypasses its idempotency cache — ``_run_idempotent``
+        # only consults ``_idem_cache`` when ``session_authority is None`` — so a retry there ran
+        # one agent turn per attempt.) The key is OPTIONAL: it adds replay protection for a
+        # caller that has a stable batch identity, but ACK-on-admission does not depend on it.
         headers["Idempotency-Key"] = idempotency_key
-        payload = {"model": payload["model"], "input": text, "session_id": session_id}
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):
