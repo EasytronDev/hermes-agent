@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any, Optional
 
@@ -125,12 +126,15 @@ def _runner_draining(adapter: Any) -> bool:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       idempotency_key: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
+    ``idempotency_key`` turns a non-push self-post into a durable, replayable admission: a retry of
+    a wake the server already accepted resumes THAT turn instead of starting a second one.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
@@ -158,7 +162,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
+    await _self_post_chat_completion(adapter, text=text, session_id=session_id,
+                                     idempotency_key=idempotency_key, **extra)
 
 
 def _delegation_display_metadata(evt: dict) -> dict:
@@ -230,7 +235,8 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None,
+                                      idempotency_key: Optional[str] = None) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -270,6 +276,17 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                "messages": [{"role": "user", "content": text}], "stream": False}
     if notification_category == "diagnostic":
         payload["hermes_notification_category"] = "diagnostic"
+    if idempotency_key:
+        # /v1/chat/completions holds the request open for the WHOLE turn, and under session
+        # authority its idempotency cache is bypassed (``_run_idempotent`` only consults
+        # ``_idem_cache`` when ``session_authority is None``). So a client timeout followed by the
+        # retry loop below ran one agent turn per attempt: the same completion woke the same
+        # session N times. /v1/runs admits the turn and answers at once, and its durable
+        # Idempotency-Key store replays the SAME run for an identical retry instead of starting
+        # a second turn.
+        url = f"http://{host}:{port}/v1/runs"
+        headers["Idempotency-Key"] = idempotency_key
+        payload = {"model": payload["model"], "input": text, "session_id": session_id}
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):
