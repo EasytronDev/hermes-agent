@@ -162,6 +162,21 @@ FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
 # dedup in #58265.
 NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
+# Why a pool entry was skipped during selection. The empty-pool log used to
+# say "all exhausted or empty", which names two very different situations
+# without saying which one happened: a credential benched by a rate limit
+# (recoverable, with a known cooldown) and a credential whose secret never
+# hydrated (the pool row exists but holds no usable key — the signature of a
+# profile-scoping / multiplexing bug). Those two need different fixes, and a
+# single generic line made the distinction cost hours of log archaeology.
+POOL_SKIP_REASON_EXHAUSTED = "exhausted"
+POOL_SKIP_REASON_SECRET_NOT_HYDRATED = "secret_not_hydrated"
+POOL_SKIP_REASON_DEAD = "dead"
+POOL_SKIP_REASON_MODEL_COOLDOWN = "model_cooldown"
+POOL_SKIP_REASON_OAUTH_NOT_HYDRATED = "oauth_not_hydrated"
+POOL_SKIP_REASON_REFRESH_FAILED = "refresh_failed"
+POOL_SKIP_REASON_PENDING_REFRESH = "pending_refresh"
+
 # Pool key prefix for custom OpenAI-compatible endpoints: all share
 # provider='custom' but are keyed 'custom:<normalized_name>'.
 CUSTOM_POOL_PREFIX = "custom:"
@@ -985,6 +1000,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS). Re-armed to None on every
         # successful selection so a recover->re-exhaust transition logs promptly.
         self._last_no_entries_log_at: Optional[float] = None
+        # Why the last selection skipped each entry (reason, entry id, detail).
+        # Read by _log_no_available_entries() to name the actual cause of an
+        # empty pool instead of printing a generic "all exhausted or empty".
+        self._last_skip_reasons: list[tuple[str, str, Optional[str]]] = []
         # #70401: consecutive mark_exhausted_and_rotate() calls whose supplied
         # credential identity matched no pool entry. These mark nothing
         # exhausted, so without a cap the pool never converges to "no available
@@ -2050,11 +2069,20 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # evidence a ``manual`` row is measured against: a real key for a provider whose
         # configured key is 125 characters is not 20 characters. No reference, no judgement.
         reference_length = reference_credential_length(self._entries)
+        # Why each entry was skipped. The empty-pool log needs the *reason*,
+        # not just the fact: "exhausted" (recoverable, known cooldown) and
+        # "secret_not_hydrated" (the row holds no usable key — a
+        # profile-scoping / multiplexing bug) need different fixes, and a
+        # single generic line made the distinction cost hours of archaeology.
+        skip_reasons: list[tuple[str, str, Optional[str]]] = []
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
             # unhydrated duplicate as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                skip_reasons.append(
+                    (POOL_SKIP_REASON_SECRET_NOT_HYDRATED, entry.id, entry.source)
+                )
                 continue
             # A row that cannot be a credential for this provider is skipped, not selected: a
             # store written before the write-time check existed (or by a tool that never had it)
@@ -2085,8 +2113,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                         )
                         entries_to_prune.append(entry.id)  # can't mutate while iterating
                         cleared_any = True
+                skip_reasons.append((POOL_SKIP_REASON_DEAD, entry.id, entry.source))
                 continue
             if model_cooldown_until(entry, model) is not None:
+                skip_reasons.append((POOL_SKIP_REASON_MODEL_COOLDOWN, entry.id, entry.source))
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
@@ -2097,6 +2127,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     and now < exhausted_until
                     and not (clear_expired and self._codex_quota_restored_upstream(entry))
                 ):
+                    skip_reasons.append(
+                        (
+                            POOL_SKIP_REASON_EXHAUSTED,
+                            entry.id,
+                            # The remaining cooldown, in whole seconds. This is
+                            # the "when can I rotate again" number the log
+                            # never carried.
+                            str(max(0, int(round(exhausted_until - now)))),
+                        )
+                    )
                     continue
                 if clear_expired:
                     # The probe may have rotated this row's single-use token pair: clear the
@@ -2107,15 +2147,18 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)
+                    skip_reasons.append((POOL_SKIP_REASON_PENDING_REFRESH, entry.id, entry.source))
                     continue
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
+                    skip_reasons.append((POOL_SKIP_REASON_REFRESH_FAILED, entry.id, entry.source))
                     continue
                 entry = refreshed
             if entry.auth_type == AUTH_TYPE_OAUTH and not (entry.access_token or "").strip():
                 # A borrowed OAuth row that failed to hydrate (or a sanitized
                 # row read straight off disk); leasing it would send an empty
                 # bearer. The API-key guard above does not cover it.
+                skip_reasons.append((POOL_SKIP_REASON_OAUTH_NOT_HYDRATED, entry.id, entry.source))
                 continue
             available.append(entry)
         if entries_to_prune:
@@ -2123,16 +2166,60 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
+        # Stash the skip reasons for the empty-pool log. Best-effort: the
+        # selection result is unchanged either way.
+        self._last_skip_reasons = skip_reasons
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
-        """Emit the empty-pool INFO line at most once per throttle window."""
+        """Emit the empty-pool INFO line at most once per throttle window.
+
+        The line names *why* the pool was empty. "all exhausted or empty"
+        conflated two situations that need different fixes: a credential
+        benched by a rate limit (recoverable on a known cooldown) and a
+        credential whose secret never hydrated (the pool row exists but
+        carries no usable key — the signature of a profile-scoping /
+        multiplexing bug). Only the reason, the short entry id, the source
+        label and the remaining TTL are logged; never key material.
+        """
         now = time.monotonic()
         last = self._last_no_entries_log_at
         if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
             return
         self._last_no_entries_log_at = now
-        logger.info("credential pool %s: no available entries (all exhausted or empty)", self.provider)
+        logger.info("credential pool: no available entries (%s)", self._describe_empty_pool())
+
+    def _describe_empty_pool(self) -> str:
+        """Summarize why the pool was empty, without leaking secret material.
+
+        Returns a parenthesized detail string for the empty-pool log line.
+        Only non-sensitive facts appear here: the skip reason, the first
+        eight characters of the entry id, the entry's source label and, for
+        an exhausted entry, the seconds left on its cooldown.
+        """
+        skips = list(self._last_skip_reasons or [])
+        if not skips:
+            # No entry was skipped (empty pool, or every entry was pruned
+            # before selection) — say so rather than inventing a reason.
+            return "reason=empty"
+        # One reason per line: the pool can be empty for more than one
+        # reason at once, and collapsing them hides the actionable one.
+        parts: list[str] = []
+        for reason, entry_id, detail in skips:
+            entry_ref = (entry_id or "")[:8] or "unknown"
+            if reason == POOL_SKIP_REASON_EXHAUSTED:
+                ttl = detail or "unknown"
+                parts.append(f"reason={reason} entry={entry_ref} ttl={ttl}s")
+            elif reason == POOL_SKIP_REASON_SECRET_NOT_HYDRATED:
+                source = detail or "unknown"
+                parts.append(f"reason={reason} entry={entry_ref} source={source}")
+            elif reason == POOL_SKIP_REASON_MODEL_COOLDOWN:
+                parts.append(f"reason={reason} entry={entry_ref}")
+            elif reason == POOL_SKIP_REASON_OAUTH_NOT_HYDRATED:
+                parts.append(f"reason={reason} entry={entry_ref}")
+            else:
+                parts.append(f"reason={reason} entry={entry_ref}")
+        return ", ".join(parts)
 
     def _select_unlocked(
         self, *, refresh: bool = True, count: bool = True, model: Optional[str] = None,
@@ -2322,7 +2409,26 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     _label, status_code, updated_entry.last_error_reason or "unknown",
                 )
             else:
-                logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
+                # Report how long the credential stays benched. The cooldown is
+                # 60s for a sole credential on a transient throttle and a full
+                # hour for a billing-classified failure, and a reader of the
+                # log could not tell those apart from "exhausted, rotating" —
+                # so nobody could say whether rotation was possible in a minute
+                # or in an hour. The TTL is recomputed from the *updated*
+                # entry, exactly as the selection path will compute it.
+                _sole = self._is_sole_credential()
+                _ttl = _exhausted_ttl(
+                    updated_entry.last_error_code,
+                    sole_credential=_sole,
+                    failure_reason=updated_entry.failure_reason,
+                )
+                logger.info(
+                    "credential pool: marking %s exhausted (status=%s) ttl=%ds reason=%s "
+                    "sole_credential=%s, rotating",
+                    _label, status_code, _ttl,
+                    updated_entry.failure_reason or "unclassified",
+                    _sole,
+                )
             self._current_id = None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry is not None and next_entry.id == entry.id:

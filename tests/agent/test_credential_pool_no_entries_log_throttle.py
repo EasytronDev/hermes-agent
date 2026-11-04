@@ -19,7 +19,7 @@ from agent.credential_pool import (
     PooledCredential,
 )
 
-_NO_ENTRIES_MSG = "credential pool test: no available entries (all exhausted or empty)"
+_NO_ENTRIES_PREFIX = "credential pool: no available entries"
 
 
 class _FakeClock:
@@ -33,7 +33,9 @@ class _FakeClock:
 
 
 def _no_entries_records(caplog) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.getMessage() == _NO_ENTRIES_MSG]
+    # Match on the stable prefix: the detail inside the parentheses names the
+    # reason the pool was empty and changes with the pool's state.
+    return [r for r in caplog.records if r.getMessage().startswith(_NO_ENTRIES_PREFIX)]
 
 
 def _make_entry(entry_id: str) -> PooledCredential:
