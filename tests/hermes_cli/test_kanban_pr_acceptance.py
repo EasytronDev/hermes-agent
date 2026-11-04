@@ -338,6 +338,25 @@ def test_rulesets_read_401_and_404_still_raise_auth(github):
 
 
 @pytest.mark.platforms("linux")
+def test_a_403_outside_the_rulesets_read_still_raises_auth(github):
+    """The degradation is scoped to the rulesets endpoint: a 403 from any other
+    read (here the check-runs read) is still an access failure and must keep
+    raising `auth`. The gate may not generalise "403 means plan limit"."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    github["status"]["check-runs"] = 403
+    github["body"]["check-runs"] = "Resource not accessible by personal access token"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="check-runs-denied", completion_contract="acme/repo")
+        kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = _receipt(conn, tid)
+    # The rulesets 403 was degraded (and recorded), but the check-runs 403 was
+    # NOT: the card still fails as an identity problem.
+    assert receipt["classification"] == "auth", receipt
+    assert "rulesets_unavailable" in receipt
+
+
+@pytest.mark.platforms("linux")
 def test_merged_pr_is_accepted_under_the_free_plan(github):
     """A MERGED PR is accepted: the gate accepts `pr.state in {OPEN, MERGED}`, and
     the free-plan 403 on the rulesets read must not disturb that."""

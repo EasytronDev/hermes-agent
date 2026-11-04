@@ -61,24 +61,6 @@ class _GateAuthError(RuntimeError):
     an infrastructure blip to retry."""
 
 
-class _GateRulesetsUnavailable(RuntimeError):
-    """The rulesets endpoint refused the read for a reason that is NOT about the
-    login's access to the repository.
-
-    GitHub gates ``/repos/{repo}/rules/branches/{branch}`` behind GitHub Pro: a
-    private repository on the free plan answers HTTP 403 with "Upgrade to GitHub
-    Pro or make this repository public to enable this feature." — for EVERY
-    branch, before any branch lookup, so the refusal is a plan limitation and
-    never a statement about the token's permissions.
-
-    Such a refusal must not be reported as ``auth``: the login demonstrably read
-    the repository (the PR was fetched over GraphQL) and the GraphQL
-    ``branchProtectionRule`` already carries the branch-protection required
-    checks. Only ruleset-backed required checks are unobservable in that state,
-    and they are simply absent from the required set.
-    """
-
-
 def _is_plan_limited_rulesets_refusal(exc: _GateAuthError) -> bool:
     """True when the rulesets refusal is a paid-plan limitation, not a denial.
 
