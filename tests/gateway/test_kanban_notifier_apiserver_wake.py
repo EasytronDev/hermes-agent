@@ -4,7 +4,7 @@ Covers the wrong-session-wake / silent-loss fixes:
 * a SendResult(success=False) return (the API server's send() stub) rewinds
   the cursor instead of advancing past a never-delivered event;
 * api_server subscriptions wake their ``chat_id`` delivery destinations via
-  the /v1/chat/completions self-post, never task ``session_id`` provenance or
+  the /v1/runs self-post, never task ``session_id`` provenance or
   handle_message (which would derive a different session key).
 """
 
