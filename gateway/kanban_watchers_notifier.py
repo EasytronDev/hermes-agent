@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import re
 from functools import partial
 from pathlib import Path
@@ -73,6 +74,23 @@ def diagnostic_event(ev) -> bool:
 # every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
+
+# Rewinds allowed for ONE claimed event batch. A rewind restores the cursor to the
+# pre-claim value, so the next tick claims the same events again and re-delivers
+# them. Without a bound, a destination that keeps failing the wake delivery (a busy
+# session whose turn outlives the 600s self-post budget) re-delivers the SAME event
+# every tick forever: the failure counter only reached 2/12 over 2 hours while the
+# user received the same text 8 times (measured 2026-11-04, #146361). The cursor is
+# the only dedup mechanism, so an unbounded rewind removes the guarantee entirely.
+#
+# After MAX_REWIND_PER_BATCH rewinds of the same batch the cursor is ADVANCED instead
+# of rewound: the batch is considered delivered (it is not silently dropped — the
+# subscription stays alive, so later events still notify) and the next tick starts
+# from the next event. This trades a possible lost delivery of one batch for a
+# bounded number of deliveries, which is the right way round for a notification
+# channel: a repeated stale message is worse than a missed one, and the task's own
+# state (comments, board view) still carries the information.
+MAX_REWIND_PER_BATCH = 3
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -485,6 +503,19 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
 }
 
 
+def _wake_idempotency_key(sub: dict, cursor: int) -> str:
+    """Stable, visible-ASCII id for one subscription's claimed event batch.
+
+    A wake retry — the HTTP client timing out on a turn that is still running, or the notifier
+    rewinding a delivery it judged failed — must resume the SAME admission, not start another
+    agent turn in the woken session. The claim cursor pins one batch, so the id is identical
+    across attempts of that batch and distinct for any later batch.
+    """
+    material = "\0".join((str(sub["task_id"]), str(sub["platform"]), str(sub["chat_id"]),
+                          str(sub.get("thread_id") or ""), str(int(cursor))))
+    return "kanban-wake:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
 
@@ -496,11 +527,16 @@ class _KanbanNotification:
     is at-least-once queueing, not an execution or final-response receipt.
     """
 
-    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
+    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict,
+                 batch_rewinds: Optional[dict] = None) -> None:
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
         self.sub_fail_counts = sub_fail_counts
+        # Per-claimed-batch rewind counter. Lives on the runner (not on this
+        # object) because every tick builds a fresh _KanbanNotification: the
+        # counter has to survive across ticks to bound the rewind.
+        self.batch_rewinds = batch_rewinds if batch_rewinds is not None else {}
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
@@ -514,6 +550,8 @@ class _KanbanNotification:
         self.head = t("gateway.kanban.ping.head", board_tag=self.board_tag, assignee_tag=tag, task_id=self.task_id)
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
+        # One claimed batch, one wake identity (see ``_wake_idempotency_key``).
+        self.wake_idempotency_key = _wake_idempotency_key(sub, d.get("cursor", 0))
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
@@ -541,8 +579,33 @@ class _KanbanNotification:
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
 
+    def _batch_key(self) -> tuple:
+        """Identity of the currently claimed event batch (the claim cursor)."""
+        return (self.sub_key, int(self.d.get("cursor", 0) or 0))
+
+    def _rewind_count(self) -> int:
+        return self.batch_rewinds.get(self._batch_key(), 0)
+
+    def _note_rewind(self) -> int:
+        key = self._batch_key()
+        n = self.batch_rewinds.get(key, 0) + 1
+        self.batch_rewinds[key] = n
+        # Forget batches we no longer retry, so the map cannot grow without bound.
+        if len(self.batch_rewinds) > 64:
+            for old in list(self.batch_rewinds)[:-32]:
+                self.batch_rewinds.pop(old, None)
+        return n
+
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries.
+
+        The rewind is BOUNDED per claimed event batch (MAX_REWIND_PER_BATCH). Past that
+        bound the cursor is advanced instead of rewound: the batch is treated as
+        delivered and the next tick starts at the following event. Without the bound,
+        a destination whose wake delivery keeps failing re-delivers the SAME event
+        forever — the cursor is the only dedup mechanism, so an unbounded rewind
+        removes it (see #146361).
+        """
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
@@ -550,8 +613,23 @@ class _KanbanNotification:
             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
             await self.unsub()
             self.clear_failures()
-        else:
-            await self.rewind()
+            self.batch_rewinds.pop(self._batch_key(), None)
+            return
+        rewinds = self._note_rewind()
+        if rewinds >= MAX_REWIND_PER_BATCH:
+            logger.warning(
+                "kanban notifier: giving up on re-delivering batch %s for %s on %s after %d rewinds; "
+                "advancing the cursor so the event is not re-sent",
+                self.d.get("cursor"), self.task_id, self.platform_str, rewinds,
+            )
+            # NOTE: the counter is deliberately NOT popped here. This batch is
+            # retired: keeping the count at the bound means a later failure for
+            # the SAME cursor advances again instead of granting a fresh rewind
+            # budget (which would let the event be re-delivered). The entry is
+            # dropped when the subscription is dropped, or pruned by the size cap.
+            await self.advance()
+            return
+        await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
@@ -640,6 +718,7 @@ class _KanbanNotification:
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
+                                   idempotency_key=self.wake_idempotency_key,
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
             return

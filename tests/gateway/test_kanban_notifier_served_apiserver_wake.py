@@ -222,7 +222,7 @@ def test_served_profile_wake_runs_in_process_only_for_the_session_it_owns(served
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert default_adapter.turns == []
     assert [c["headers"]["X-Hermes-Session-Id"] for c in _FakeHttpSession.calls] == ["default-origin"]
-    assert _FakeHttpSession.calls[0]["url"].endswith("/v1/chat/completions")
+    assert _FakeHttpSession.calls[0]["url"].endswith("/v1/runs")
     assert _unseen(task, chat_id="default-origin") == []
 
 

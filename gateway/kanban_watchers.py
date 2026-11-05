@@ -89,6 +89,12 @@ class GatewayKanbanWatchersMixin:
 
         sub_fail_counts: dict[tuple, int] = getattr(self, "_kanban_sub_fail_counts", {})
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Per-claimed-batch rewind counter: bounds how many times ONE claimed
+        # event batch may be rewound (and therefore re-delivered). Kept on the
+        # runner so it survives across ticks — each tick builds a fresh
+        # _KanbanNotification for the same subscription.
+        batch_rewinds: dict[tuple, int] = getattr(self, "_kanban_batch_rewinds", {})
+        self._kanban_batch_rewinds = batch_rewinds
         notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
         self._kanban_notifier_profile = notifier_profile
 
@@ -115,6 +121,7 @@ class GatewayKanbanWatchersMixin:
                 for d in deliveries:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                        batch_rewinds=batch_rewinds,
                     ).deliver()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)

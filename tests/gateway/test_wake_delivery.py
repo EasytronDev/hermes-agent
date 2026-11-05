@@ -3,9 +3,13 @@
 Two strategies:
 * push-capable adapters keep the synthetic MessageEvent / handle_message path;
 * the stateless API server (supports_async_delivery=False) self-POSTs
-  /v1/chat/completions with the RAW session id in X-Hermes-Session-Id, so the
+  /v1/runs with the RAW session id in X-Hermes-Session-Id, so the
   wake turn resumes the REAL session instead of a parallel invisible one
   keyed by build_session_key().
+
+/v1/runs admits the turn and answers 202 at once: the wake is delivered when
+the admission exists, so the self-post does not wait for the agent turn (which
+would hold the caller's queue for up to WAKE_TURN_TIMEOUT_SECONDS).
 """
 
 import asyncio
@@ -58,7 +62,7 @@ async def _serve(handler):
     from aiohttp import web
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post("/v1/runs", handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -68,9 +72,9 @@ async def _serve(handler):
 
 
 def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
-    """The self-post carries the RAW session id header + bearer auth and a
-    single user message with stream=false — the exact entry point real
-    gateway turns use."""
+    """The self-post carries the RAW session id header + bearer auth and the
+    wake text as the run's input — the exact entry point real gateway turns
+    use, on the route that admits the turn and answers at once."""
     from aiohttp import web
 
     seen = {}
@@ -79,7 +83,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
         seen["body"] = await request.json()
-        return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+        return web.json_response({"run_id": "run_1", "status": "started"}, status=202)
 
     async def run():
         runner, port = await _serve(handler)
@@ -92,10 +96,8 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
     assert seen["auth"] == "Bearer sekrit"
-    assert seen["body"]["stream"] is False
-    assert seen["body"]["messages"] == [
-        {"role": "user", "content": "task done — wake"}
-    ]
+    assert seen["body"]["input"] == "task done — wake"
+    assert seen["body"]["session_id"] == "raw-sid-42"
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
@@ -111,7 +113,7 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return web.json_response({"error": "busy"}, status=429)
-        return web.json_response({"choices": []})
+        return web.json_response({"run_id": "run_1", "status": "started"}, status=202)
 
     async def run():
         runner, port = await _serve(handler)
