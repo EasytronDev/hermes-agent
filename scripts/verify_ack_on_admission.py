@@ -86,7 +86,8 @@ async def main():
             await gate.wait()
             state["slow_turn_finished"] = True
 
-        asyncio.create_task(_turn())
+        # Keep a reference: a fire-and-forget task can be garbage collected mid-run.
+        state.setdefault("turn_tasks", []).append(asyncio.create_task(_turn()))
         return web.json_response({"run_id": run_id, "status": "started",
                                   "replayed": False}, status=202)
 

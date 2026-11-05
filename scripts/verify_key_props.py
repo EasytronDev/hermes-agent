@@ -13,6 +13,14 @@ Run: python3 verify_key_props.py <wake.py> <notifier.py>
 import asyncio
 import importlib.util
 import sys
+from pathlib import Path
+
+# The repo root goes on sys.path: this script lives under scripts/, but the modules
+# it loads (gateway/kanban_watchers_notifier.py) import the repo's own packages
+# (``agent.i18n``), which resolve only from the repo root.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 WAKE, NOTIFIER = sys.argv[1], sys.argv[2]
 
@@ -96,7 +104,8 @@ async def check_replay(wakepath, key):
             await wake._self_post_chat_completion(
                 A(), text="[kanban] Task t_x completed.", session_id="api_server:webui",
                 idempotency_key=key)
-        except Exception as exc:
+        # health: allow BLE001 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
+        except Exception as exc:  # noqa: BLE001
             print("  delivery %d raised %s" % (attempt, type(exc).__name__))
     await runner.cleanup()
     print("P2 replay (two deliveries of the SAME batch):")

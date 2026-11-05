@@ -113,7 +113,7 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key=None):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -170,7 +170,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key=None):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -195,7 +195,7 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(adapter, *, text, session_id, idempotency_key=None):
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")

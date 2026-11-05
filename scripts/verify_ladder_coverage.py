@@ -90,13 +90,14 @@ async def main():
     wake_mod.WAKE_TURN_TIMEOUT_SECONDS = 0.5
     wake_mod._RETRY_DELAYS_SECONDS = (0.05, 0.05, 0.05)
     # Force the client to "time out" so it re-POSTs, exactly like the live bug.
-    orig = wake_mod.aiohttp if hasattr(wake_mod, "aiohttp") else None
+    # Force the client to "time out" so it re-POSTs, exactly like the live bug.
     for attempt in range(4):
         try:
             await wake_mod._self_post_chat_completion(
                 _A(), text="[kanban] Task t_7f49d2b3 completed.",
                 session_id="api_server:webui", idempotency_key=key)
-        except Exception as exc:
+        # health: allow BLE001 S110 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
+        except Exception:  # noqa: BLE001
             pass
     inner_turns = state["turns_started"]
     inner_adm = state["admissions"]
@@ -116,7 +117,8 @@ async def main():
             await wake_mod._self_post_chat_completion(
                 _A(), text="[kanban] Task t_7f49d2b3 completed.",
                 session_id="api_server:webui", idempotency_key=k)
-        except Exception:
+        # health: allow BLE001 S110 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
+        except Exception:  # noqa: BLE001
             pass
     outer_turns = state["turns_started"] - before
     print("  notifier deliveries    : 12")

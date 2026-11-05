@@ -52,7 +52,7 @@ async def main():
         state["runs"] += 1
         key = request.headers.get("Idempotency-Key")
         state["keys"].append(key)
-        body = await request.json()
+        await request.json()
         if key and key in admitted_runs:
             # Durable replay: the SAME run, no second turn.
             state["replayed"] += 1
@@ -89,7 +89,8 @@ async def main():
     try:
         await wake._self_post_chat_completion(
             adapter, text="[kanban] Task t_x completed.", session_id="api_server:webui")
-    except Exception as exc:
+    # health: allow BLE001 -- the probe compares the SHIPPED and the PATCHED behaviour; an exception IS one of the outcomes it reports.
+    except Exception as exc:  # noqa: BLE001
         outcome_a = "raised %s" % type(exc).__name__
     a = dict(state)
 
@@ -101,7 +102,8 @@ async def main():
         await wake._self_post_chat_completion(
             adapter, text="[kanban] Task t_x completed.", session_id="api_server:webui",
             idempotency_key="kanban-wake:deadbeef")
-    except Exception as exc:
+    # health: allow BLE001 -- the probe compares the SHIPPED and the PATCHED behaviour; an exception IS one of the outcomes it reports.
+    except Exception as exc:  # noqa: BLE001
         outcome_b = "raised %s" % type(exc).__name__
     b = dict(state)
 

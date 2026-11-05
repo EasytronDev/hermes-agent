@@ -122,14 +122,16 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                 await wake_mod._self_post_chat_completion(
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui", idempotency_key=key)
-            except Exception:
+            # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
+            except Exception:  # noqa: BLE001
                 pass
         for _ in range(outer_deliveries):
             try:
                 await wake_mod._self_post_chat_completion(
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui", idempotency_key=key)
-            except Exception:
+            # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
+            except Exception:  # noqa: BLE001
                 pass
     else:
         # No key: the wake posts to /v1/chat/completions, which blocks past the
@@ -141,7 +143,8 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                     await wake_mod._self_post_chat_completion(
                         _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                         session_id="api_server:webui")
-                except Exception:
+                # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
+                except Exception:  # noqa: BLE001
                     pass
         # The outer ladder: 12 re-deliveries of the same batch, no identity.
         for _ in range(outer_deliveries):
@@ -149,7 +152,8 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                 await wake_mod._self_post_chat_completion(
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui")
-            except Exception:
+            # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
+            except Exception:  # noqa: BLE001
                 pass
 
     await runner.cleanup()

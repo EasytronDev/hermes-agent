@@ -163,6 +163,9 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
     from aiohttp import web
 
     state = {"slow_turn_finished": False, "admissions": [], "routes": []}
+    # Set by the fake server when the SLOW card's admission lands: the test waits for
+    # that condition instead of a fixed delay (HX013).
+    slow_admitted = asyncio.Event()
     admitted = {}
     gate = asyncio.Event()
 
@@ -179,6 +182,8 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
         if key:
             admitted[key] = run_id
         state["admissions"].append({"run_id": run_id, "input": body.get("input")})
+        if body.get("input", "").startswith("[wake] slow card"):
+            slow_admitted.set()
 
         async def _slow_turn():
             # The turn is slow: it would hold a /v1/chat/completions request open
@@ -231,7 +236,7 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
             # A DIFFERENT card finishes while the slow one is still in flight.
             # It is a DIFFERENT event, so it gets its own key: a replayed key
             # would (correctly) resolve to the earlier run instead of a new one.
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(slow_admitted.wait(), timeout=10.0)
             delivered = await wake_mod._self_post_chat_completion(
                 adapter, text=f"[wake] fast card ({label})", session_id="api_server:webui",
                 **({"idempotency_key": f"{key}:fast"} if key else {}))
