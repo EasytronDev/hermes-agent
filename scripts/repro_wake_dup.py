@@ -90,8 +90,8 @@ async def main():
         await wake._self_post_chat_completion(
             adapter, text="[kanban] Task t_x completed.", session_id="api_server:webui")
     # health: allow BLE001 -- the probe compares the SHIPPED and the PATCHED behaviour; an exception IS one of the outcomes it reports.
-    except Exception as exc:  # noqa: BLE001
-        outcome_a = "raised %s" % type(exc).__name__
+    except Exception as exc:
+        outcome_a = f"raised {type(exc).__name__}"
     a = dict(state)
 
     # --- Scenario B: the PATCHED behaviour (idempotency key present) ---
@@ -103,24 +103,21 @@ async def main():
             adapter, text="[kanban] Task t_x completed.", session_id="api_server:webui",
             idempotency_key="kanban-wake:deadbeef")
     # health: allow BLE001 -- the probe compares the SHIPPED and the PATCHED behaviour; an exception IS one of the outcomes it reports.
-    except Exception as exc:  # noqa: BLE001
-        outcome_b = "raised %s" % type(exc).__name__
+    except Exception as exc:
+        outcome_b = f"raised {type(exc).__name__}"
     b = dict(state)
 
     await runner.cleanup()
 
-    print("A shipped (no key): chat_completions=%d runs=%d turns_started=%d outcome=%s"
-          % (a["chat_completions"], a["runs"], a["turns_started"], outcome_a))
-    print("B patched (key):    chat_completions=%d runs=%d turns_started=%d outcome=%s"
-          % (b["chat_completions"], b["runs"], b["turns_started"], outcome_b))
-    print("B idempotency keys sent: %s" % b["keys"])
+    print(f"A shipped (no key): chat_completions={a['chat_completions']} runs={a['runs']} turns_started={a['turns_started']} outcome={outcome_a}")
+    print(f"B patched (key):    chat_completions={b['chat_completions']} runs={b['runs']} turns_started={b['turns_started']} outcome={outcome_b}")
+    print(f"B idempotency keys sent: {b['keys']}")
     print()
     if b["turns_started"] > 1:
-        print("RESULT: FAIL - the patched path still started %d turns for ONE event"
-              % b["turns_started"])
+        print(f"RESULT: FAIL - the patched path still started {b['turns_started']} turns for ONE event")
         return 1
     if b["turns_started"] != 1:
-        print("RESULT: FAIL - expected exactly 1 turn, got %d" % b["turns_started"])
+        print(f"RESULT: FAIL - expected exactly 1 turn, got {b['turns_started']}")
         return 1
     if not b["keys"] or not b["keys"][0]:
         print("RESULT: FAIL - no Idempotency-Key header was sent")

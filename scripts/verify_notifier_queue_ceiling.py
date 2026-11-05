@@ -19,7 +19,7 @@ TREE = Path(sys.argv[1]).resolve()
 sys.path.insert(0, "/opt/hermes")
 sys.path.insert(0, str(TREE))
 
-import gateway as pkg  # noqa: E402
+import gateway as pkg
 
 
 def load(path, name):
@@ -108,14 +108,14 @@ async def main():
     print(f"cards entregues em serie      : {N}")
     print(f"tempo total                  : {elapsed:.3f}s")
     print(f"por card (media)              : {elapsed/N*1000:.1f}ms")
-    print(f"turno do agente em producao   : 600s (WAKE_TURN_TIMEOUT_SECONDS)")
+    print("turno do agente em producao   : 600s (WAKE_TURN_TIMEOUT_SECONDS)")
     print()
-    print(f"ANTES (self-post no /v1/chat/completions): o loop serial ficava "
-          f"600s POR CARD")
+    print("ANTES (self-post no /v1/chat/completions): o loop serial ficava "
+          "600s POR CARD")
     print(f"  -> {N} cards = {N*600}s = {N*600/60:.0f} min de fila retida")
     print(f"DEPOIS (ACK na admissao)      : {elapsed:.3f}s para {N} cards "
           f"(~{elapsed/N*1000:.0f}ms por card)")
-    print(f"  -> a fila nao' depende mais do turno do agente")
+    print("  -> a fila nao' depende mais do turno do agente")
     print()
     print(f"admissoes: {len(state['admissions'])} (1 por card entregue -- "
           f"nenhuma entrega perdida, nenhuma duplicata)")

@@ -30,7 +30,7 @@ TREE = Path(sys.argv[1]).resolve()
 sys.path.insert(0, "/opt/hermes")
 sys.path.insert(0, str(TREE))
 
-import gateway as pkg  # noqa: E402
+import gateway as pkg
 
 
 def load(path, name):
@@ -69,12 +69,12 @@ class _Server:
         if key in self.admitted:
             return web.json_response({"run_id": self.admitted[key], "replayed": True},
                                      headers={"Idempotency-Replayed": "true"})
-        self.admitted[key] = "run_%d" % self.admissions
+        self.admitted[key] = f"run_{self.admissions}"
         self.turns += 1
         return web.json_response({"run_id": self.admitted[key], "replayed": False}, status=202)
 
 
-from aiohttp import web  # noqa: E402
+from aiohttp import web
 
 
 class _A:
@@ -123,7 +123,7 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui", idempotency_key=key)
             # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         for _ in range(outer_deliveries):
             try:
@@ -131,7 +131,7 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui", idempotency_key=key)
             # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
     else:
         # No key: the wake posts to /v1/chat/completions, which blocks past the
@@ -144,7 +144,7 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                         _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                         session_id="api_server:webui")
                 # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         # The outer ladder: 12 re-deliveries of the same batch, no identity.
         for _ in range(outer_deliveries):
@@ -153,12 +153,12 @@ async def run_case(name, *, use_key, use_ack_on_accept, inner_posts=4, outer_del
                     _A(port), text="[kanban] Task t_7f49d2b3 completed.",
                     session_id="api_server:webui")
             # health: allow BLE001 S110 -- the probe measures how many agent turns the SERVER admitted; a client-side failure (timeout, refused connection) is the measurement, not a defect to swallow.
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     await runner.cleanup()
-    print("  %-28s agent turns = %-4d (chat POSTs=%d, runs admissions=%d)"
-          % (name, srv.turns, srv.chat_requests, srv.admissions))
+    print(f"  {name:<28} agent turns = {srv.turns:<4d} (chat POSTs={srv.chat_requests}, runs admissions={srv.admissions})"
+          )
     return srv.turns
 
 
@@ -170,9 +170,9 @@ async def main():
     b = await run_case("(b) ACK on accept only", use_key=False, use_ack_on_accept=True)
     shipped = await run_case("shipped (neither)", use_key=False, use_ack_on_accept=False)
     print()
-    print("  (a) alone  : %d turn(s)  <- the key alone already fixes it" % a)
-    print("  (b) alone  : %d turn(s)  <- ACK alone does NOT stop the outer ladder" % b)
-    print("  shipped    : %d turn(s)" % shipped)
+    print(f"  (a) alone  : {a} turn(s)  <- the key alone already fixes it")
+    print(f"  (b) alone  : {b} turn(s)  <- ACK alone does NOT stop the outer ladder")
+    print(f"  shipped    : {shipped} turn(s)")
     print()
     ok = (a == 1 and b > 1)
     print("RESULT: %s" % ("PASS - (a) is sufficient; (b) alone leaves the outer ladder open"

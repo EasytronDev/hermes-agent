@@ -28,7 +28,7 @@ TREE = Path(sys.argv[1]).resolve()
 sys.path.insert(0, "/opt/hermes")
 sys.path.insert(0, str(TREE))
 
-import gateway as pkg  # noqa: E402
+import gateway as pkg
 
 
 def load(path, name):
@@ -62,7 +62,7 @@ async def main():
             return web.json_response({"run_id": admitted[key], "status": "queued",
                                       "replayed": True},
                                      headers={"Idempotency-Replayed": "true"})
-        admitted[key] = "run_%d" % state["admissions"]
+        admitted[key] = f"run_{state['admissions']}"
         state["turns_started"] += 1
         return web.json_response({"run_id": admitted[key], "status": "started",
                                   "replayed": False}, status=202)
@@ -97,14 +97,14 @@ async def main():
                 _A(), text="[kanban] Task t_7f49d2b3 completed.",
                 session_id="api_server:webui", idempotency_key=key)
         # health: allow BLE001 S110 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     inner_turns = state["turns_started"]
     inner_adm = state["admissions"]
     print("  client attempts        : 4")
-    print("  server admissions      : %d" % inner_adm)
-    print("  AGENT TURNS started    : %d  <- the cost" % inner_turns)
-    print("  durable replays        : %d" % state["replays"])
+    print(f"  server admissions      : {inner_adm}")
+    print(f"  AGENT TURNS started    : {inner_turns}  <- the cost")
+    print(f"  durable replays        : {state['replays']}")
 
     print()
     print("OUTER ladder (12 notifier deliveries of the SAME claimed batch):")
@@ -118,11 +118,11 @@ async def main():
                 _A(), text="[kanban] Task t_7f49d2b3 completed.",
                 session_id="api_server:webui", idempotency_key=k)
         # health: allow BLE001 S110 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     outer_turns = state["turns_started"] - before
     print("  notifier deliveries    : 12")
-    print("  AGENT TURNS started    : %d  <- the cost" % outer_turns)
+    print(f"  AGENT TURNS started    : {outer_turns}  <- the cost")
     print("  (the key is derived from the BATCH, so every outer re-delivery")
     print("   carries the same key -> the server replays instead of re-running)")
 
@@ -130,7 +130,7 @@ async def main():
 
     total_turns = state["turns_started"]
     print()
-    print("TOTAL agent turns started for ONE card event: %d" % total_turns)
+    print(f"TOTAL agent turns started for ONE card event: {total_turns}")
     ok = (inner_turns == 1 and outer_turns == 0 and total_turns == 1)
     print("RESULT: %s" % ("PASS - ONE event = ONE turn, across both ladders"
                           if ok else "FAIL"))

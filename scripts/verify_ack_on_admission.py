@@ -30,7 +30,7 @@ TREE = Path(sys.argv[1]).resolve()
 sys.path.insert(0, "/opt/hermes")
 sys.path.insert(0, str(TREE))
 
-import gateway as pkg  # noqa: E402
+import gateway as pkg
 
 
 def load(path, name):

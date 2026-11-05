@@ -163,9 +163,6 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
     from aiohttp import web
 
     state = {"slow_turn_finished": False, "admissions": [], "routes": []}
-    # Set by the fake server when the SLOW card's admission lands: the test waits for
-    # that condition instead of a fixed delay (HX013).
-    slow_admitted = asyncio.Event()
     admitted = {}
     gate = asyncio.Event()
 
@@ -182,8 +179,6 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
         if key:
             admitted[key] = run_id
         state["admissions"].append({"run_id": run_id, "input": body.get("input")})
-        if body.get("input", "").startswith("[wake] slow card"):
-            slow_admitted.set()
 
         async def _slow_turn():
             # The turn is slow: it would hold a /v1/chat/completions request open
@@ -225,18 +220,29 @@ async def test_a_slow_card_does_not_delay_another_cards_notification():
         state["admissions"].clear()
         state["routes"].clear()
         gate = asyncio.Event()
+        # Set by the CLIENT when the slow POST returns (at admission, while the agent
+        # turn it started keeps running): the test waits for that condition instead
+        # of a fixed delay (HX013). It is per-iteration: the second shape must wait
+        # for ITS OWN slow POST, not the first shape's.
+        slow_posted = asyncio.Event()
 
         slow = None
         try:
             started = time.monotonic()
-            slow = asyncio.create_task(wake_mod._self_post_chat_completion(
-                adapter, text=f"[wake] slow card ({label})", session_id="api_server:webui",
-                **({"idempotency_key": f"{key}:slow"} if key else {})))
+            async def _slow_post():
+                await wake_mod._self_post_chat_completion(
+                    adapter, text=f"[wake] slow card ({label})", session_id="api_server:webui",
+                    **({"idempotency_key": f"{key}:slow"} if key else {}))
+                # The POST returned: the wake was ADMITTED (202) while the agent turn
+                # it started keeps running. That return IS the condition to wait for.
+                slow_posted.set()
+
+            slow = asyncio.create_task(_slow_post())
 
             # A DIFFERENT card finishes while the slow one is still in flight.
             # It is a DIFFERENT event, so it gets its own key: a replayed key
             # would (correctly) resolve to the earlier run instead of a new one.
-            await asyncio.wait_for(slow_admitted.wait(), timeout=10.0)
+            await asyncio.wait_for(slow_posted.wait(), timeout=10.0)
             delivered = await wake_mod._self_post_chat_completion(
                 adapter, text=f"[wake] fast card ({label})", session_id="api_server:webui",
                 **({"idempotency_key": f"{key}:fast"} if key else {}))

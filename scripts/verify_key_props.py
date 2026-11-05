@@ -44,7 +44,7 @@ def check_key_props():
     k5 = n._wake_idempotency_key(dict(sub, chat_id="webui"), 43293)
     ok = True
     print("P1 key stability:")
-    print("  same batch twice      : %s  -> %s" % ("SAME" if k1 == k2 else "DIFFERENT", k1))
+    print(f"  same batch twice      : {'SAME' if k1 == k2 else 'DIFFERENT'}  -> {k1}")
     print("  next cursor (43294)   : %s" % ("DIFFERENT" if k1 != k3 else "SAME (BAD)"))
     print("  other task_id         : %s" % ("DIFFERENT" if k1 != k4 else "SAME (BAD)"))
     print("  other chat_id         : %s" % ("DIFFERENT" if k1 != k5 else "SAME (BAD)"))
@@ -105,13 +105,13 @@ async def check_replay(wakepath, key):
                 A(), text="[kanban] Task t_x completed.", session_id="api_server:webui",
                 idempotency_key=key)
         # health: allow BLE001 -- the probe counts SERVER admissions; a client-side timeout is the measurement, not a defect.
-        except Exception as exc:  # noqa: BLE001
-            print("  delivery %d raised %s" % (attempt, type(exc).__name__))
+        except Exception as exc:
+            print(f"  delivery {attempt} raised {type(exc).__name__}")
     await runner.cleanup()
     print("P2 replay (two deliveries of the SAME batch):")
-    print("  turns started   : %d" % state["turns_started"])
-    print("  idempotent replays: %d" % state["replays"])
-    print("  keys sent       : %s" % state["keys"])
+    print(f"  turns started   : {state['turns_started']}")
+    print(f"  idempotent replays: {state['replays']}")
+    print(f"  keys sent       : {state['keys']}")
     ok = state["turns_started"] == 1 and state["replays"] == 1
     return ok
 
