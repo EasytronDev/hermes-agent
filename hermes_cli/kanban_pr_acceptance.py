@@ -61,6 +61,29 @@ class _GateAuthError(RuntimeError):
     an infrastructure blip to retry."""
 
 
+def _is_plan_limited_rulesets_refusal(exc: _GateAuthError) -> bool:
+    """True when the rulesets refusal is a paid-plan limitation, not a denial.
+
+    GitHub answers ``/repos/{repo}/rules/branches/{branch}`` with HTTP 403
+    "Upgrade to GitHub Pro or make this repository public to enable this
+    feature." for a private repository on the free plan. That refusal is about
+    the repository's plan, not about the token: it is returned for EVERY branch
+    (including branches that do not exist) and is checked before any branch
+    lookup.
+
+    GitHub never answers 403 for a repository the login simply cannot see — it
+    answers 404 "Not Found" (see ``GET /repos/{owner}/{repo}`` for a repo the
+    login has no access to). So a 403 that arrives while the repository is
+    readable is necessarily the plan limitation, and a genuine access failure
+    still surfaces as 401/404 and keeps raising ``_GateAuthError``.
+
+    Only the status code and endpoint are inspected; gh's stderr (which can
+    carry credential and host details) is never persisted.
+    """
+    message = str(exc)
+    return "HTTP 403" in message and "/rules/branches/" in message
+
+
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
     """Child env for ``gh``: the card's profile identity when one is resolvable.
 
@@ -133,8 +156,24 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        # The rulesets read is a SECOND source of required checks (GraphQL's
+        # branchProtectionRule does not cover rulesets). It is also the only one
+        # GitHub reserves for paid plans: on a private repo in the free plan it
+        # answers 403 "Upgrade to GitHub Pro..." regardless of the token. The
+        # PR read above already proved this login can see the repository, so a
+        # 403 here is a plan limitation, not an identity failure — it must not
+        # be reported as `auth` (which is retry-hostile and unfixable by the
+        # operator). 401/404 keep raising: those still mean "no access".
+        rules_endpoint = f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100"
+        try:
+            rules = _api(rules_endpoint, paginate=True, profile_home=profile_home)
+        except _GateAuthError as exc:
+            if not _is_plan_limited_rulesets_refusal(exc):
+                raise
+            receipt["rulesets_unavailable"] = (
+                "rulesets endpoint unavailable for this repository "
+                f"({exc}); required checks taken from the branch protection rule only")
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
