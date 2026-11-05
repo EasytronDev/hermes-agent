@@ -668,7 +668,7 @@ def test_build_process_event_source_named_profile_key(monkeypatch, tmp_path):
 async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch, tmp_path):
     """An event whose session_key is a RAW api_server session id (not an
     agent:main:... structured key) must wake the real session via the
-    /v1/chat/completions self-post instead of being dropped for missing
+    /v1/runs self-post instead of being dropped for missing
     routing metadata."""
     runner = _build_runner(monkeypatch, tmp_path, "all")
     api_adapter = SimpleNamespace(
@@ -680,7 +680,7 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key=None):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -716,7 +716,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, idempotency_key=None):
         posts.append(session_id)
 
     import gateway.wake as wake_mod
@@ -738,7 +738,7 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
 ):
     """#85957: an async_delegation completion targeting a stateless api_server
     session must be persisted as a durable DELIVERY row — never self-POSTed
-    to /v1/chat/completions as a new role=user prompt (which starts an
+    to /v1/runs as a new role=user prompt (which starts an
     unauthorized agent turn after the client-owned parent turn ended)."""
     runner = _build_runner(monkeypatch, tmp_path, "all")
     api_adapter = SimpleNamespace(
