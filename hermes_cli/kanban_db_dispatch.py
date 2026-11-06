@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -30,6 +31,8 @@ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+_log = logging.getLogger(__name__)
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -1555,6 +1558,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    release_detail: Optional[dict] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1570,9 +1574,17 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    PR, or the PR is already MERGED/CLOSED on GitHub, which means the work it
+    carried is over and holding the card would park the next lane for the whole
+    window). The review lane skips the last two: they are the *inputs* to a
+    review handoff. Stale / dead claim locks are NOT a guard reason — the
+    reclaim passes own those.
+
+    ``release_detail`` is an optional dict the caller passes in; when the
+    guard RELEASES a card because of a finished PR it is filled with
+    ``{"reason": "pr_finished", "pr": "<owner/repo#number>"}`` so the
+    dispatcher can record WHY the card was let go (the audit trail for a
+    decision that otherwise looks like an unexplained spawn).
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1643,18 +1655,59 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
+    pr_comments = [(t, _kb._lossy_text(c["body"]) or "") for t, c in _rows_since(
+        conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+        cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
+        if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+    if pr_comments:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
+                conn, "task_events", task_id, max(t for t, _ in pr_comments),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+            return None
+        # The newest PR comment's PR decides: a PR that is already MERGED or
+        # CLOSED carries no pending work, so holding the card for it parks the
+        # next lane (QA) for the whole window on work that is already done.
+        # GitHub is the authority on PR state — the board is not.
+        finished_ref = _finished_pr_ref(pr_comments)
+        if finished_ref is not None:
+            if release_detail is not None:
+                release_detail.update({
+                    "reason": "pr_finished",
+                    "pr": finished_ref,
+                })
             return None
         return "active_pr"
 
     return None
+
+
+def _finished_pr_ref(pr_comments: list[tuple[int, str]]) -> Optional[str]:
+    """The slug of the newest PR in ``pr_comments`` when GitHub says it is
+    finished (closed or merged); None when the guard must keep holding.
+
+    The lookup is best-effort by design: with no credential, a private repo
+    seen anonymously, a rate limit or a network error the answer is UNKNOWN
+    and this returns None — the guard keeps holding, which is the fail-safe
+    (the cost of a wrong "finished" is a duplicate worker; the cost of a
+    wrong "not finished" is a card parked for the whole window).
+
+    Only the newest comment's PR is consulted: it is the one the prior
+    worker actually opened, and a second, older PR in the same thread is
+    already covered by that newest one.
+    """
+    from hermes_cli import kanban_pr_state as prs
+
+    newest = max(pr_comments, key=lambda pair: pair[0])[1]
+    ref = prs.parse_pr_url(newest)
+    if ref is None:
+        return None
+    try:
+        state = prs.pull_request_state(ref)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("PR state lookup raised for %s: %s", ref.slug, exc)
+        return None
+    return ref.slug if state == prs.PRState.CLOSED else None
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
@@ -2097,7 +2150,8 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_release: dict = {}
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane, release_detail=guard_release)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2111,6 +2165,12 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+    if guard_release and not dry_run:
+        # The guard RELEASED the card (a PR that GitHub already reports as
+        # merged/closed). Record why, so the spawn does not look like an
+        # unexplained duplicate: the trail names the PR that was already done.
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "respawn_guard_released", dict(guard_release))
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
