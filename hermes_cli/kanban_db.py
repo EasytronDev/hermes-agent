@@ -2670,6 +2670,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    metadata = _attach_tracked_dirty_warning(conn, task_id, metadata)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
@@ -2879,6 +2880,24 @@ def _flag_phantom_prose_refs(
             )
 
 
+def _attach_tracked_dirty_warning(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict],
+) -> Optional[dict]:
+    """Add ``metadata['tracked_dirty']`` when the task's workspace has dirt.
+
+    A completion is never blocked by uncommitted work; instead the closing run
+    carries a visible warning so ``kanban show`` points the operator at the
+    files before a merge. The key is written ONLY when there is real dirt — a
+    clean workspace gets no key at all.
+
+    Fail-open: the check never raises and never changes the metadata the
+    caller passed in (a missing/None metadata stays None).
+    """
+    from hermes_cli.kanban_db_tracked_dirty import attach_tracked_dirty_warning
+
+    return attach_tracked_dirty_warning(conn, task_id, metadata)
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: Optional[dict], *, summary: Optional[str],
     result: Optional[str],
@@ -2886,33 +2905,12 @@ def _merge_completion_prose_artifacts(
     """Legacy workers named deliverables only by absolute path in prose; add
     those that exist under the scratch workspace to ``metadata["artifacts"]``
     before cleanup can erase them."""
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
-        return metadata
-    if not _is_managed_scratch_path(workspace):
-        return metadata
-    text = "\n".join(part for part in (summary, result) if part)
-    if not text:
-        return metadata
-    prefix = re.escape(str(workspace))
-    discovered: list[str] = []
-    for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
-        raw = match.group(0).rstrip(".,;:!?)]}")
-        candidate = Path(raw)
-        if candidate.is_file():
-            discovered.append(str(candidate))
-    if not discovered:
-        return metadata
-    updated = dict(metadata) if isinstance(metadata, dict) else {}
-    existing = updated.get("artifacts")
-    merged = list(existing) if isinstance(existing, (list, tuple)) else []
-    seen = {str(path) for path in merged}
-    for path in discovered:
-        if path not in seen:
-            merged.append(path)
-            seen.add(path)
-    updated["artifacts"] = merged
-    return updated
+    from hermes_cli.kanban_db_tracked_dirty import merge_completion_prose_artifacts
+
+    return merge_completion_prose_artifacts(
+        conn, task_id, metadata, summary=summary, result=result,
+    )
+
 
 
 def _persist_scratch_completion_artifacts(
