@@ -49,7 +49,18 @@ pkg.wake = wake_mod
 
 class _Server:
     """A busy api_server: chat-completions blocks past the client timeout;
-    /v1/runs admits at once and honours Idempotency-Key."""
+    /v1/runs admits at once and honours Idempotency-Key.
+
+    The durable Idempotency-Key store REPLAYS only a request that actually
+    carries an identity. A request with NO Idempotency-Key header has no
+    identity to replay against, so the server admits it as a NEW turn — that is
+    the whole point of the comparison below: arm (b) and the shipped arm post
+    WITHOUT a key, and the server MUST see every one of them as a distinct
+    turn. (Keying the cache on ``None`` would let the server "replay" a
+    request it never had an identity for, which would silently turn the
+    missing-key arms into a measurement of the fake server instead of a
+    measurement of the fix.)
+    """
 
     def __init__(self):
         self.turns = 0
@@ -66,7 +77,9 @@ class _Server:
     async def runs(self, request):
         self.admissions += 1
         key = request.headers.get("Idempotency-Key")
-        if key in self.admitted:
+        # A MISSING Idempotency-Key is NOT an identity: only a request that
+        # carries one can be replayed against the durable store.
+        if key is not None and key in self.admitted:
             return web.json_response({"run_id": self.admitted[key], "replayed": True},
                                      headers={"Idempotency-Replayed": "true"})
         self.admitted[key] = f"run_{self.admissions}"
