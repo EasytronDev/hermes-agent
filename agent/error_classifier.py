@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
+from agent.credential_pool_validation import FAILURE_CAUSE_INVALID_API_KEY
+
 logger = logging.getLogger(__name__)
 
 # Synthetic code for the OpenAI SDK rejecting a provider's SSE ``data:`` field
@@ -92,6 +94,22 @@ class ClassifiedError:
     def billing_unverified(self) -> bool:
         """True when a ``billing`` verdict rests on an ambiguous body (#82154)."""
         return bool(self.error_context.get("billing_unverified"))
+
+    @property
+    def failure_cause(self) -> str:
+        """The credential-cause code behind an auth verdict.
+
+        ``missing_api_key`` — no key was sent (the runtime refused before the request).
+        ``invalid_api_key`` — a key was sent and the provider rejected it.
+        ``pool_credential_invalid`` — the key that was sent came from a credential-pool row
+        that cannot be a key for this provider.
+
+        The auth copy used to read "rejected your API key" for all three, so a board could not
+        tell a corrected cause (promote) from a quota wall (do not promote). The code rides the
+        rendered error text, which is what the Kanban dispatcher stores in
+        ``last_failure_error``.
+        """
+        return str(self.error_context.get("failure_cause") or "")
 
 
 # ── Pattern tables (lowercased substrings) ──────────────────────────────
@@ -1051,7 +1069,14 @@ def classify_api_error(
         if host:
             message = f"{message} (endpoint: {host})"
     base = {"status_code": status_code, "provider": provider, "model": model, "message": message}
-    return ClassifiedError(**{**base, **verdict})
+    classified = ClassifiedError(**{**base, **verdict})
+    if classified.is_auth:
+        # Name the credential cause so the board can tell a corrected cause (promote the card)
+        # from a wall no retry heals (leave it parked). A 401 means a key WAS sent and the
+        # provider refused it; the runtime's own refusal (no key at all) never reaches here —
+        # it is an ``AuthError`` with code ``missing_api_key``.
+        classified.error_context.setdefault("failure_cause", FAILURE_CAUSE_INVALID_API_KEY)
+    return classified
 
 
 def _off_route_host(c: _Ctx) -> str:

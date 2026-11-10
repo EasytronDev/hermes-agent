@@ -26,6 +26,9 @@ from __future__ import annotations
 from typing import Any, Optional
 
 __all__ = [
+    "FAILURE_CAUSE_INVALID_API_KEY",
+    "FAILURE_CAUSE_MISSING_API_KEY",
+    "FAILURE_CAUSE_POOL_CREDENTIAL_INVALID",
     "POOL_CREDENTIAL_DEFECT_INVALID",
     "POOL_CREDENTIAL_DEFECT_EMPTY",
     "manual_pool_credential_defect",
@@ -33,11 +36,19 @@ __all__ = [
     "pool_credential_defect_reason",
 ]
 
-# Cause code carried by the row (and by the AuthError the runtime raises for it). The dispatcher
+# Cause codes carried by the row (and by the AuthError the runtime raises for it). The dispatcher
 # classifies on the text of ``last_failure_error``; a stable token in that text is what lets it
 # tell "the credential was refused" from "no credential was sent" and from "the quota is spent".
 POOL_CREDENTIAL_DEFECT_INVALID = "pool_credential_invalid"
 POOL_CREDENTIAL_DEFECT_EMPTY = "missing_api_key"
+
+# The same three causes, named for the turn/board layer. ``missing_api_key`` — the runtime
+# refused before the request, so NO key was sent. ``invalid_api_key`` — a key was sent and the
+# provider rejected it. ``pool_credential_invalid`` — the key that was sent came from a pool
+# row that cannot be a key for this provider.
+FAILURE_CAUSE_MISSING_API_KEY = "missing_api_key"
+FAILURE_CAUSE_INVALID_API_KEY = "invalid_api_key"
+FAILURE_CAUSE_POOL_CREDENTIAL_INVALID = POOL_CREDENTIAL_DEFECT_INVALID
 
 # A secret shorter than this cannot be a real API key for any provider Hermes talks to: the
 # shortest keys in the wild (a handful of characters) are local-server placeholders, which the
