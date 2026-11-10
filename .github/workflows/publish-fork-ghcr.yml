@@ -58,7 +58,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       inputs.arch == '' ||
-      contains(',' + inputs.arch + ',', ',' + matrix.arch + ',')
+      contains(inputs.arch, matrix.arch)
     strategy:
       fail-fast: false
       matrix:
@@ -214,8 +214,7 @@ jobs:
       always() &&
       needs.build.result == 'success' &&
       (github.event_name == 'push' || inputs.arch == '' ||
-       (contains(',' + inputs.arch + ',', ',amd64,') &&
-        contains(',' + inputs.arch + ',', ',arm64,')))
+       (contains(inputs.arch, 'amd64') && contains(inputs.arch, 'arm64')))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
