@@ -187,17 +187,29 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "::notice::manifest ${IMAGE_NAME}:${TAG} -> $digest"
 
+      # The revision label lives on the per-arch image CONFIG, not on the
+      # multi-arch index (an index has no config of its own), so the check
+      # walks each member of the index, reads its config blob and compares
+      # the label with the candidate commit.
       - name: Verify the revision label matches the candidate commit
         env:
           TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
           DIGEST: ${{ steps.digest.outputs.digest }}
+          ARCH_LIST: ${{ inputs.arch || 'amd64,arm64' }}
         run: |
           set -euo pipefail
-          revision="$(docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" \
-            --format '{{json .Image}}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("org.opencontainers.image.revision",""))')"
-          echo "revision=$revision"
-          test "$revision" = "$CANDIDATE_COMMIT" || {
-            echo "::error::revision label $revision != candidate $CANDIDATE_COMMIT"; exit 1; }
+          IFS=',' read -ra legs <<< "$ARCH_LIST"
+          for arch in "${legs[@]}"; do
+            revision="$(docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}-${arch}" \
+              --format '{{json .Image}}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("org.opencontainers.image.revision",""))')"
+            echo "${arch}: revision=${revision}"
+            test "$revision" = "$CANDIDATE_COMMIT" || {
+              echo "::error::${arch} revision label '${revision}' != candidate ${CANDIDATE_COMMIT}"
+              exit 1
+            }
+          done
+          echo "::notice::every leg carries org.opencontainers.image.revision=${CANDIDATE_COMMIT}"
 
       # A container package is PRIVATE by default. The deploy host pulls the
       # image by digest with no registry credential, so the package must be
