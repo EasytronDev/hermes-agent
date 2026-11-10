@@ -1256,6 +1256,25 @@ class AIAgent(
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         # Shown to the user as the reply, so no decision codes; the code stays in result["guardrail"].
+        #
+        # A kanban worker has no human in the loop: "tell me how you'd like to proceed, or
+        # send `continue`" is a question into the void — the owner does not read the card,
+        # and the worker exits rc=0 without a terminal board call, so the card crash-loops
+        # or waits for the breaker hours later with the turn's work lost (18 such runs in
+        # 7 days on this host). The kanban branch tells the worker to close the card with
+        # what it already has.
+        try:
+            from agent.kanban_stop import build_guardrail_halt_reply
+
+            kanban_reply = build_guardrail_halt_reply(
+                tool_name=decision.tool_name or "",
+                count=decision.count,
+            )
+        except Exception:
+            logger.debug("kanban guardrail-halt reply failed", exc_info=True)
+            kanban_reply = None
+        if kanban_reply:
+            return kanban_reply
         return (
             f"I stopped retrying because I kept running {decision.tool_name or 'the same tool'} "
             f"{decision.count} times without making progress. The last result above shows what "

@@ -439,6 +439,9 @@ _CONTROL_STATE: dict[str, Any] = {
     "_trim_after_tool_batch": False,  # a >=1 MB tool result was committed; trim once the batch unwinds
     "_tool_guardrails": ToolCallGuardrailController,
     "_tool_guardrail_halt_decision": None,
+    # Bounded budget of the "a guardrail halted you — close the card" follow-up turns a
+    # kanban worker gets. Run-scoped (NOT reset per turn): the budget is for the whole run.
+    "_kanban_guardrail_halt_nudges": 0,
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,

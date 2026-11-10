@@ -107,6 +107,25 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("## Body")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+    lines.append("## Rules")
+    lines.append(
+        "This card is headless: the owner does not read it, so a question asked in prose "
+        "is never answered."
+    )
+    lines.append(
+        "- End every turn with a terminal board call: `kanban_complete`, `kanban_request_review`, "
+        "`kanban_request_changes`, `kanban_schedule` or `kanban_block`. A plain-text reply is NOT a "
+        "terminal state — ending without one is booked as a protocol violation and the run is lost."
+    )
+    lines.append(
+        "- **A guardrail that blocks your turn (e.g. `idempotent_no_progress_block`) means CLOSE the "
+        "card, never ask for `continue`.** Use the result you already have (the guardrail says it is "
+        "enough) and call `kanban_complete` with what was delivered; if the scope did not fit, complete "
+        "with the part that landed and leave the rest in a `kanban_comment`. "
+        "`kanban_block` is only for a decision the owner must make. Never ask the owner how to proceed "
+        "and never wait for a `continue`."
+    )
+    lines.append("")
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
