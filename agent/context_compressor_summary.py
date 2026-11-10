@@ -155,6 +155,29 @@ class SummaryDispatchMixin:
 
         return self._bound_summary_output(content, self.max_summary_tokens * CHARS_PER_TOKEN)
 
+    def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
+        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
+        if getattr(self, "tail_mode", "lean") != "lean":
+            return summary
+        from agent.context_compressor import (
+            _LEAN_ANCHOR_HEADING,
+            _LEAN_RECOVERY_HEADING,
+            _LEAN_USER_MESSAGES_HEADING,
+            _build_anchor_index,
+            _build_recovery_footer,
+            _build_verbatim_user_section,
+            _redact_compaction_text,
+        )
+
+        for heading, build in (
+            (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
+            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
+            (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
+        ):
+            if heading not in summary:
+                summary += build()
+        return summary
+
     def _request_past_provider_window(self) -> bool:
         """True when the last real prompt already exceeds the provider's context window.
 
