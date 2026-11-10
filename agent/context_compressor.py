@@ -3104,6 +3104,8 @@ class ContextCompressor(
                     self._fallback_compression_streak,
                     max(0.0, self._anti_thrash_recovery_deadline - _now),
                 )
+            if self._anti_thrash_bypass_allowed():
+                return False
             return True
         # Guard not tripped: disarm any pending clock so a later trip starts a full window.
         self._set_anti_thrash_recovery_deadline(0.0)
@@ -3564,7 +3566,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         summary = elide(summary, _FALLBACK_SUMMARY_MAX_CHARS)
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
-        return self._augment_summary_lean(summary, turns_to_summarize)
+        summary = self._augment_summary_lean(summary, turns_to_summarize)
+        return self._capped_summary(summary)
 
     def _demote_stale_tail_tools(self, messages: list[dict[str, Any]], tail_start: int) -> list[dict[str, Any]]:
         """Lean mode: demote stale tail tool results to recovery stubs (``demote_stale_tail_tools``)."""
@@ -3572,19 +3575,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if demoted and not self.quiet_mode:
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
         return result
-
-    def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
-        if getattr(self, "tail_mode", "lean") != "lean":
-            return summary
-        for heading, build in (
-            (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
-            (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
-        ):
-            if heading not in summary:
-                summary += build()
-        return summary
 
     @classmethod
     def _bound_summary_input(cls, content: str) -> str:
@@ -3929,7 +3919,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
             _raise_if_stale_attempt(self)
             self._record_summary_success(summary)
-            return self._with_summary_prefix(summary)
+            handoff = self._with_summary_prefix(summary)
+            return self._capped_summary(handoff)
         except Exception as e:  # health: allow BLE001 -- unchanged summary boundary: every failure goes to _on_summary_failure
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
 
