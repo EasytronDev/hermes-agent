@@ -22,6 +22,10 @@ on:
         description: 'Image variant: slim | desktop'
         required: false
         default: 'slim'
+      arch:
+        description: 'Architectures to build: "amd64,arm64" for the multi-arch manifest, or a single one for a single-arch tag.'
+        required: false
+        default: 'amd64,arm64'
   push:
     branches: ['feat/kanban-on-v0231']
     paths:
@@ -51,7 +55,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        # The dispatch input picks the legs. The emulated arm64 build on an
+        # x64 runner is slow (the upstream uses native ARM runners, which the
+        # fork has no access to), so a single-arch dispatch is supported.
+        arch: ${{ fromJSON(inputs.arch || '["amd64","arm64"]') }}
         variant: [slim]
         include:
           - arch: amd64
@@ -148,12 +155,15 @@ jobs:
         id: manifest
         env:
           TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+          ARCH_LIST: ${{ inputs.arch || 'amd64,arm64' }}
         run: |
           set -euo pipefail
           args=()
-          for arch in amd64 arm64; do
+          IFS=',' read -ra legs <<< "$ARCH_LIST"
+          for arch in "${legs[@]}"; do
             args+=("${IMAGE_NAME}:${TAG}-${arch}")
           done
+          echo "::notice::manifest legs: ${legs[*]}"
           for i in 1 2 3; do
             if docker buildx imagetools create -t "${IMAGE_NAME}:${TAG}" "${args[@]}"; then
               break
