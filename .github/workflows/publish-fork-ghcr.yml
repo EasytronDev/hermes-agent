@@ -1,0 +1,196 @@
+name: Publish Fork Image (GHCR)
+
+# Fork-owned publish lane. The upstream `docker.yml` gates every publish job on
+# `github.repository == 'NousResearch/hermes-agent'`, so on this fork those jobs
+# never run — and the fork has no Docker Hub secret. This lane publishes the
+# fork's own image to GHCR under an OWN tag, using the GITHUB_TOKEN (no new
+# secret required). It never touches `nousresearch/*`, and it never moves
+# `stable`, `latest` or `v0.23.1`.
+#
+# The build reuses the fork's Dockerfile and the upstream's own stamp +
+# profile-boundary steps, so the published bytes carry the same identity
+# contract as the upstream lane.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (defaults to v0.23.1-kanban1).'
+        required: false
+        default: 'v0.23.1-kanban1'
+      variant:
+        description: 'Image variant: slim | desktop'
+        required: false
+        default: 'slim'
+  push:
+    branches: ['feat/kanban-on-v0231']
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/publish-fork-ghcr.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-fork-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The fork's own namespace on GHCR. NOT nousresearch/* — that is upstream's.
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/hermes-agent
+  CANDIDATE_COMMIT: ${{ github.sha }}
+
+jobs:
+  build:
+    name: Build and publish (${{ matrix.variant }}/${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        variant: [slim]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          # The stamp and boundary scripts run on the runner's python3, whose
+          # version depends on the runner image. Pin it instead of trusting it.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Write install stamp
+        run: |
+          display="$(python3 -m scripts.releases.distance)"
+          identity=(--commit "$CANDIDATE_COMMIT")
+          base="${display%%+*}"
+          development="${display#*+}"
+          if [ "$development" = "$display" ]; then distance=0; else distance="${development%%.*}"; fi
+          identity+=(--base-version "$base" --display-version "$display" --distance "$distance")
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci "${identity[@]}"
+          cat install-stamp.json
+
+      - name: Reject profile exports in the build context
+        run: python3 scripts/ci/check_profile_archive_boundary.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (${{ matrix.variant }}/${{ matrix.arch }})
+        id: push
+        uses: docker/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          build-args: |
+            HERMES_BOT_DESKTOP=${{ matrix.variant == 'desktop' && '1' || '0' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ inputs.tag || 'v0.23.1-kanban1' }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.CANDIDATE_COMMIT }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.tag || 'v0.23.1-kanban1' }}
+
+      - name: Record pushed digest
+        run: |
+          digest="$(docker buildx imagetools inspect \
+            "${{ env.IMAGE_NAME }}:${{ inputs.tag || 'v0.23.1-kanban1' }}-${{ matrix.arch }}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::Unexpected digest format: $digest"; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "::notice::pushed ${{ matrix.arch }} -> $digest"
+
+  manifest:
+    name: Assemble multi-arch manifest
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image: ${{ steps.receipt.outputs.image }}
+      tag: ${{ steps.receipt.outputs.tag }}
+      digest: ${{ steps.receipt.outputs.digest }}
+      commit: ${{ steps.receipt.outputs.commit }}
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        id: manifest
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+        run: |
+          set -euo pipefail
+          args=()
+          for arch in amd64 arm64; do
+            args+=("${IMAGE_NAME}:${TAG}-${arch}")
+          done
+          for i in 1 2 3; do
+            if docker buildx imagetools create -t "${IMAGE_NAME}:${TAG}" "${args[@]}"; then
+              break
+            fi
+            if [ "$i" = 3 ]; then echo "::error::imagetools create failed after 3 attempts"; exit 1; fi
+            echo "::warning::imagetools create failed (attempt $i); retrying in 20s"
+            sleep 20
+          done
+
+      - name: Inspect and record the manifest digest
+        id: digest
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::Unexpected manifest digest: $digest"; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "::notice::manifest ${IMAGE_NAME}:${TAG} -> $digest"
+
+      - name: Verify the revision label matches the candidate commit
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          revision="$(docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" \
+            --format '{{json .Image}}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("org.opencontainers.image.revision",""))')"
+          echo "revision=$revision"
+          test "$revision" = "$CANDIDATE_COMMIT" || {
+            echo "::error::revision label $revision != candidate $CANDIDATE_COMMIT"; exit 1; }
+
+      - name: Publish the digest as a job output
+        id: receipt
+        run: |
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag || 'v0.23.1-kanban1' }}" >> "$GITHUB_OUTPUT"
+          echo "digest=${{ steps.digest.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          echo "commit=${CANDIDATE_COMMIT}" >> "$GITHUB_OUTPUT"
