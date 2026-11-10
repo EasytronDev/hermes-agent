@@ -243,6 +243,42 @@ jobs:
           echo "::warning::the package is still private; run the 'Publish Fork Package Visibility' workflow"
           exit 0
 
+      - name: Prove the pull works with a credential (the Dokploy path)
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -uo pipefail
+          # The package is private until someone with `admin:packages` flips
+          # it (the workflow token and any token this repo holds do not
+          # carry that scope). A registry credential on the deploy host is
+          # the other supported path, so the image must be proven readable
+          # with a credential — the same way the deploy host will read it.
+          token="$(curl -sS -u "${GITHUB_ACTOR}:${GH_TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:easytrondev/hermes-agent:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
+          if [ -z "$token" ]; then
+            echo "::warning::no credentialed pull token was issued"
+            exit 0
+          fi
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/easytrondev/hermes-agent/manifests/${TAG}-${ARCH}")"
+          echo "credentialed manifest HTTP ${code}"
+          if [ "$code" = 200 ]; then
+            echo "::notice::the image is pullable WITH a registry credential"
+          else
+            echo "::warning::the credentialed pull also answered HTTP ${code}"
+          fi
+
   manifest:
     name: Assemble multi-arch manifest
     needs: [build]
