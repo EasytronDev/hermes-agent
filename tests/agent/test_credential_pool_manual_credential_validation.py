@@ -62,11 +62,27 @@ def _seed_env_credential(tmp_path, monkeypatch, name: str, value: str) -> None:
     monkeypatch.setenv(name, value)
 
 
+def _hermetic_profile(tmp_path, monkeypatch) -> None:
+    """Point the profile at *tmp_path* and strip the provider's ambient credentials.
+
+    The pool seeds itself from the environment: ``get_env_prefer_dotenv`` reads the
+    profile's ``.env`` and falls back to the process environment (the secret scope
+    reads ``os.environ`` when no scope is bound). A key left in ``os.environ`` by
+    another module — the runtime's own env loader installs the profile's ``.env`` into
+    ``os.environ`` process-wide — would therefore seed a row into this test's store and
+    make the test depend on whatever ran before it. The provider's key vars are removed
+    so each test starts from the store it wrote and nothing else.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for name in ("MINIMAX_API_KEY", "MINIMAX_TOKEN", "MINIMAX_API_HOST"):
+        monkeypatch.delenv(name, raising=False)
+
+
 # ── defence 1: the write-time refusal ──────────────────────────────────────────────────────────────
 
 def test_add_entry_refuses_a_manual_credential_that_cannot_be_the_configured_key(tmp_path, monkeypatch):
     """A 20-character ``manual`` row never reaches the store: the cost of a 401 is the card."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
     from agent.credential_pool_admin import CredentialRejectedError
@@ -83,7 +99,7 @@ def test_add_entry_refuses_a_manual_credential_that_cannot_be_the_configured_key
 
 def test_add_entry_accepts_a_credential_the_same_length_as_the_configured_key(tmp_path, monkeypatch):
     """The refusal judges the SHAPE against the configured key, not an absolute length."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
 
@@ -96,7 +112,7 @@ def test_add_entry_accepts_a_credential_the_same_length_as_the_configured_key(tm
 
 def test_add_entry_accepts_a_manual_credential_when_the_pool_has_no_configured_key(tmp_path, monkeypatch):
     """No evidence, no judgement: a provider the profile holds no key for is never refused."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
 
     pool = load_pool("minimax")
@@ -108,7 +124,7 @@ def test_add_entry_accepts_a_manual_credential_when_the_pool_has_no_configured_k
 
 def test_add_entry_accepts_a_non_manual_source_of_any_length(tmp_path, monkeypatch):
     """A credential Hermes obtained from the provider itself is not the owner's to judge."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, PooledCredential, load_pool
 
@@ -123,7 +139,7 @@ def test_add_entry_accepts_a_non_manual_source_of_any_length(tmp_path, monkeypat
 
 def test_pool_never_selects_a_malformed_manual_row(tmp_path, monkeypatch):
     """A store that ALREADY holds a malformed row cannot put it in front of a healthy sibling."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import load_pool
 
@@ -137,7 +153,7 @@ def test_pool_never_selects_a_malformed_manual_row(tmp_path, monkeypatch):
 
 def test_pool_peek_skips_a_malformed_manual_row(tmp_path, monkeypatch):
     """``peek`` is what the credential resolver reads: it must not hand back the bad row."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import load_pool
 
@@ -152,7 +168,7 @@ def test_runtime_resolution_sends_the_env_credential_not_the_malformed_pool_row(
     The pool rung of the ladder runs before the ``.env`` rung, so a malformed row that reached
     the store used to be the credential every request carried.
     """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     _seed_env_credential(tmp_path, monkeypatch, "MINIMAX_API_KEY", GOOD_SECRET)
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -164,7 +180,7 @@ def test_runtime_resolution_sends_the_env_credential_not_the_malformed_pool_row(
 
 def test_a_manual_row_is_still_selected_when_the_pool_holds_no_configured_key(tmp_path, monkeypatch):
     """Fail-open: without a configured key to compare against, the pool serves what it holds."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openrouter": [
         {"id": "row1", "label": "row1", "auth_type": "api_key", "priority": 0,
          "source": "manual", "access_token": "tok-1"}]}})
@@ -257,7 +273,7 @@ def test_a_malformed_manual_row_reports_the_pool_cause():
 
 def test_a_stored_malformed_row_is_not_deleted_but_not_selected(tmp_path, monkeypatch):
     """The skip is a SELECTION rule, not a delete: the row stays for the operator to inspect."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _hermetic_profile(tmp_path, monkeypatch)
     _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
