@@ -2126,14 +2126,17 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
-    # Barrier: a card with NO execution contract must never become a worker.
+    # Two refusals, ONE decision (the function is at the repo's complexity
+    # cap): a card with NO execution contract must never become a worker, and
+    # neither may a card whose assignee names no profile. ``_kbcn`` records the
+    # refusal in its own bucket and returns True.
+    profile_exists = _profile_exists_fn()
     if _kbcn.refuse_no_contract_card(conn, row, result, dry_run=dry_run):
         return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
-    profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
@@ -2141,14 +2144,8 @@ def _dispatch_lane_task(
         # condition never expires on its own, so write it once: a repeat only when something
         # else happened on the card since (reassign, comment) — not one row per tick forever,
         # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+        _kbcn.record_skip_event_once(
+            conn, task_id, "skipped_nonspawnable", {"assignee": assignee}, dry_run=dry_run)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.

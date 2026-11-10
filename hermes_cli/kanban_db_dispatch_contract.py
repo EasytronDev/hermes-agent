@@ -61,6 +61,34 @@ def event_payload(row: sqlite3.Row) -> dict:
     }
 
 
+def record_skip_event_once(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: dict,
+    *,
+    dry_run: bool,
+) -> None:
+    """Write a ``skipped_*`` event ONCE per card, not once per dispatcher tick.
+
+    The condition behind these events never resolves on its own, so a repeat
+    would only spam the board. The event is rewritten only when something else
+    happened on the card since (an edit that filled the body, a reassign, a
+    comment) — the payload then differs.
+    """
+    if dry_run:
+        return
+    from hermes_cli import kanban_db as _kb
+
+    with _kb.write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+        if (last is None or last["kind"] != kind
+                or last["payload"] != _kb._json_or_null(payload)):
+            _kb._append_event(conn, task_id, kind, payload)
+
+
 def refuse_no_contract_card(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -93,23 +121,8 @@ def refuse_no_contract_card(
     """
     if not is_no_contract(row):
         return False
-    # Late-bound: ``kanban_db`` imports this module's sibling, so importing it
-    # at module scope would close the cycle.
-    from hermes_cli import kanban_db as _kb
-
     task_id = row["id"]
     result.skipped_no_contract.append(task_id)
-    # One event per card (not one per tick): the condition never changes on
-    # its own, so a repeat would only spam the board. Re-write it only when
-    # something else happened on the card since (an edit that filled the body,
-    # a comment).
-    if not dry_run:
-        with _kb.write_txn(conn):
-            last = conn.execute(
-                "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-            payload = event_payload(row)
-            if (last is None or last["kind"] != "skipped_no_contract"
-                    or last["payload"] != _kb._json_or_null(payload)):
-                _kb._append_event(conn, task_id, "skipped_no_contract", payload)
+    record_skip_event_once(
+        conn, task_id, "skipped_no_contract", event_payload(row), dry_run=dry_run)
     return True
