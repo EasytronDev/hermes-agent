@@ -387,6 +387,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd, profile: Optional[s
         PooledCredential,
         load_pool,
     )
+    from agent.credential_pool_admin import CredentialRejectedError
 
     provider = (body.provider or "").strip().lower()
     api_key = (body.api_key or "").strip()
@@ -428,6 +429,10 @@ async def add_credential_pool_entry(body: CredentialPoolAdd, profile: Optional[s
             return {"ok": True, "provider": provider, "count": len(pool.entries())}
         except HTTPException:
             raise
+        except CredentialRejectedError as exc:
+            # A credential that cannot be a key for this provider: the user's input, not a
+            # server fault. 400 with the reason, no traceback (it would read as a crash).
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             _log.exception("POST /api/credentials/pool failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
