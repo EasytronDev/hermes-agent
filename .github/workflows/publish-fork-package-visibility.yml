@@ -1,0 +1,148 @@
+name: Publish Fork Package Visibility
+
+# Decoupled from the image build on purpose. A container package starts
+# PRIVATE, and the deploy host pulls the image by digest with no registry
+# credential, so the package must be public for the anonymous token to be
+# issued. Flipping the visibility does not need a rebuild — it is a
+# registry-side metadata change — so it lives in its own workflow that
+# finishes in seconds instead of waiting behind a multi-arch build.
+#
+# The build lane (publish-fork-ghcr.yml) also attempts the flip; this one
+# exists so the visibility can be fixed (or re-proved) without re-running
+# the build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package name (without the owner prefix).'
+        required: false
+        default: 'hermes-agent'
+      tag:
+        description: 'Tag to prove the anonymous pull against (empty = only the token check).'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  visibility:
+    name: Make the package public and prove the anonymous pull
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Resolve the owner type and the package endpoint
+        id: owner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_type="$(curl -sS -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/users/${GITHUB_REPOSITORY_OWNER}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))')"
+          case "$owner_type" in
+            Organization) path="orgs/${GITHUB_REPOSITORY_OWNER}" ;;
+            User)         path="users/${GITHUB_REPOSITORY_OWNER}" ;;
+            *) echo "::error::Unknown owner type: $owner_type"; exit 1 ;;
+          esac
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+          echo "::notice::owner endpoint: ${path}"
+
+      # The GITHUB_TOKEN of a workflow carries `packages: write`, which is
+      # enough to publish but NOT to administer a package — the visibility
+      # endpoint needs `admin:packages`. Try the workflow token first (it
+      # works when the workflow runs with an admin-scoped token), then fall
+      # back to a PAT stored as a repository secret.
+      - name: Set the package visibility to public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT: ${{ secrets.PACKAGES_ADMIN_TOKEN }}
+          OWNER_PATH: ${{ steps.owner.outputs.path }}
+          PACKAGE: ${{ inputs.package || 'hermes-agent' }}
+        run: |
+          set -euo pipefail
+          endpoint="https://api.github.com/${OWNER_PATH}/packages/container/${PACKAGE}/visibility"
+          echo "endpoint: ${endpoint}"
+          done_flag=0
+          for label in GITHUB_TOKEN PAT; do
+            token_var="$label"
+            token="${!token_var:-}"
+            if [ -z "$token" ]; then
+              echo "::notice::${label} is not available, skipping"
+              continue
+            fi
+            for attempt in 1 2 3; do
+              code="$(curl -sS -o /tmp/visibility.json -w '%{http_code}' -X PATCH \
+                -H "Authorization: token ${token}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Accept: application/vnd.github.package-deletes-preview+json" \
+                "${endpoint}" \
+                -d '{"visibility":"public"}')"
+              echo "::notice::${label} attempt ${attempt}: HTTP ${code}"
+              if [ "$code" = 200 ]; then
+                cat /tmp/visibility.json
+                echo "visibility=public" >> "$GITHUB_OUTPUT"
+                done_flag=1
+                break
+              fi
+              cat /tmp/visibility.json
+              # 404 here is GitHub masking "not authorized" for this token.
+              if [ "$code" = 404 ] || [ "$code" = 403 ]; then
+                break
+              fi
+              sleep 10
+            done
+            if [ "$done_flag" = 1 ]; then break; fi
+          done
+          if [ "$done_flag" != 1 ]; then
+            echo "::error::could not flip the visibility with the available tokens"
+            echo "::error::a PAT with 'admin:packages' (org scope) is required; store it as the PACKAGES_ADMIN_TOKEN secret"
+            exit 1
+          fi
+          echo "visibility=public" >> "$GITHUB_OUTPUT"
+
+      - name: Prove the anonymous pull works
+        env:
+          TAG: ${{ inputs.tag }}
+          PACKAGE: ${{ inputs.package || 'hermes-agent' }}
+        run: |
+          set -euo pipefail
+          repo="easytrondev/${PACKAGE}"
+          for attempt in 1 2 3 4 5 6; do
+            token="$(curl -sS \
+              "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
+            if [ -n "$token" ]; then
+              echo "::notice::anonymous pull token issued on attempt ${attempt}"
+              if [ -n "$TAG" ]; then
+                code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer ${token}" \
+                  -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                  "https://ghcr.io/v2/${repo}/manifests/${TAG}")"
+                echo "manifest ${TAG} HTTP ${code}"
+                test "$code" = 200 || { echo "::error::manifest not pullable anonymously"; exit 1; }
+              fi
+              exit 0
+            fi
+            echo "::warning::anonymous token not issued yet (attempt ${attempt})"
+            sleep 10
+          done
+          echo "::error::anonymous pull never became available"
+          exit 1
+
+      - name: Summary
+        env:
+          PACKAGE: ${{ inputs.package || 'hermes-agent' }}
+        run: |
+          {
+            echo "### GHCR package is public"
+            echo ""
+            echo "- package: \`ghcr.io/easytrondev/${PACKAGE}\`"
+            echo "- visibility: public"
+            echo "- anonymous pull: proven"
+          } >> "$GITHUB_STEP_SUMMARY"
