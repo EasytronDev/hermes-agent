@@ -11,12 +11,16 @@ These tests pin the three defences:
 1. the write-time refusal (``add_entry`` never stores such a row),
 2. the selection-time skip (a store that already holds one cannot poison the pool), and
 3. the cause code that tells the board WHICH credential failure happened.
+
+The judgement is evidence-based: a ``manual`` row is measured against the pool's own
+owner-provided credential (``env:``/``config:``/``model_config``). Without that reference there
+is nothing to compare against and the row is accepted — so a provider the profile has no
+configured key for is never refused.
 """
 
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -60,9 +64,10 @@ def _seed_env_credential(tmp_path, monkeypatch, name: str, value: str) -> None:
 
 # ── defence 1: the write-time refusal ──────────────────────────────────────────────────────────────
 
-def test_add_entry_refuses_a_manual_credential_that_cannot_be_a_key(tmp_path, monkeypatch):
+def test_add_entry_refuses_a_manual_credential_that_cannot_be_the_configured_key(tmp_path, monkeypatch):
     """A 20-character ``manual`` row never reaches the store: the cost of a 401 is the card."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
     from agent.credential_pool_admin import CredentialRejectedError
 
@@ -73,12 +78,13 @@ def test_add_entry_refuses_a_manual_credential_that_cannot_be_a_key(tmp_path, mo
             priority=0, source=SOURCE_MANUAL, access_token=BAD_SECRET))
     assert "minimax" in str(excinfo.value)
     # Nothing was written: the store does not hold the refused row.
-    assert pool.entries() == []
+    assert [e.id for e in pool.entries()] == ["38a4aa22", "38a4aa11", "38a4aa"]
 
 
-def test_add_entry_accepts_a_real_length_manual_credential(tmp_path, monkeypatch):
-    """The refusal judges the SHAPE, not the provider: a real key still gets in."""
+def test_add_entry_accepts_a_credential_the_same_length_as_the_configured_key(tmp_path, monkeypatch):
+    """The refusal judges the SHAPE against the configured key, not an absolute length."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
 
     pool = load_pool("minimax")
@@ -86,12 +92,24 @@ def test_add_entry_accepts_a_real_length_manual_credential(tmp_path, monkeypatch
         provider="minimax", id="good123", label="good123", auth_type=AUTH_TYPE_API_KEY,
         priority=0, source=SOURCE_MANUAL, access_token=GOOD_SECRET))
     assert entry.id == "good123"
-    assert [e.id for e in load_pool("minimax").entries()] == ["good123"]
+
+
+def test_add_entry_accepts_a_manual_credential_when_the_pool_has_no_configured_key(tmp_path, monkeypatch):
+    """No evidence, no judgement: a provider the profile holds no key for is never refused."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
+
+    pool = load_pool("minimax")
+    entry = pool.add_entry(PooledCredential(
+        provider="minimax", id="shortok", label="shortok", auth_type=AUTH_TYPE_API_KEY,
+        priority=0, source=SOURCE_MANUAL, access_token="short"))
+    assert entry.id == "shortok"
 
 
 def test_add_entry_accepts_a_non_manual_source_of_any_length(tmp_path, monkeypatch):
-    """A credential Hermes obtained from the provider itself is not the user's to judge."""
+    """A credential Hermes obtained from the provider itself is not the owner's to judge."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _incident_pool())
     from agent.credential_pool import AUTH_TYPE_API_KEY, PooledCredential, load_pool
 
     pool = load_pool("minimax")
@@ -144,6 +162,19 @@ def test_runtime_resolution_sends_the_env_credential_not_the_malformed_pool_row(
     assert runtime.get("source") != "manual"
 
 
+def test_a_manual_row_is_still_selected_when_the_pool_holds_no_configured_key(tmp_path, monkeypatch):
+    """Fail-open: without a configured key to compare against, the pool serves what it holds."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openrouter": [
+        {"id": "row1", "label": "row1", "auth_type": "api_key", "priority": 0,
+         "source": "manual", "access_token": "tok-1"}]}})
+    from agent.credential_pool import load_pool
+
+    selected = load_pool("openrouter").select()
+    assert selected is not None
+    assert selected.id == "row1"
+
+
 # ── defence 3: the cause code ───────────────────────────────────────────────────────────────────
 
 def test_a_401_is_classified_as_invalid_api_key():
@@ -186,8 +217,7 @@ def test_the_auth_copy_carries_the_cause_code():
                              summary="login fail: Please carry the API secret key")
     assert "invalid_api_key" in copy
     # The old sentence said the same thing for every credential failure; the cause names which.
-    assert copy != ("MiniMax rejected your API key, so the model can't be reached. Update it in "
-                     "Settings → Providers, or run `hermes setup` in a terminal.")
+    assert "rejected your API key, so the model can't be reached" not in copy
 
 
 def test_a_missing_key_is_reported_as_missing_api_key():
@@ -201,27 +231,28 @@ def test_a_missing_key_is_reported_as_missing_api_key():
     assert "rejected your API key" not in rendered
 
 
-def test_the_pool_defect_code_is_stable():
+def test_the_cause_codes_are_stable_tokens():
     """The cause codes are tokens, not prose: a classifier matches on them."""
     from agent.credential_pool_validation import (
         FAILURE_CAUSE_INVALID_API_KEY, FAILURE_CAUSE_MISSING_API_KEY,
-        FAILURE_CAUSE_POOL_CREDENTIAL_INVALID, POOL_CREDENTIAL_MIN_LENGTH,
+        FAILURE_CAUSE_POOL_CREDENTIAL_INVALID,
     )
 
     assert FAILURE_CAUSE_MISSING_API_KEY == "missing_api_key"
     assert FAILURE_CAUSE_INVALID_API_KEY == "invalid_api_key"
     assert FAILURE_CAUSE_POOL_CREDENTIAL_INVALID == "pool_credential_invalid"
-    assert POOL_CREDENTIAL_MIN_LENGTH >= 32
 
 
-def test_a_malformed_manual_row_reports_the_pool_cause(tmp_path, monkeypatch):
+def test_a_malformed_manual_row_reports_the_pool_cause():
     """The pool row's own defect carries the ``pool_credential_invalid`` code."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     from agent.credential_pool_validation import manual_pool_credential_defect
 
     row = {"id": "38a4aa22", "label": "38a4aa22", "auth_type": "api_key", "priority": 0,
            "source": "manual", "access_token": BAD_SECRET}
-    assert manual_pool_credential_defect("minimax", row) == "pool_credential_invalid"
+    assert manual_pool_credential_defect("minimax", row, reference_length=len(GOOD_SECRET)) == \
+        "pool_credential_invalid"
+    # Without the reference (no configured key to compare against) there is no defect.
+    assert manual_pool_credential_defect("minimax", row) is None
 
 
 def test_a_stored_malformed_row_is_not_deleted_but_not_selected(tmp_path, monkeypatch):
