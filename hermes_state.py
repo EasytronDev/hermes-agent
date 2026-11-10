@@ -72,7 +72,8 @@ from hermes_state_api_content import SessionApiContentMixin
 from hermes_state_coverage import SessionCoverageMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
-    _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
+    _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_auto_vacuum, apply_database_pragmas,
+    apply_wal_with_fallback, incremental_vacuum,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
