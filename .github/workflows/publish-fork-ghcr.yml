@@ -52,13 +52,24 @@ jobs:
     name: Build and publish (${{ matrix.variant }}/${{ matrix.arch }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # A dispatch may ask for a single architecture. The matrix is static (a
+    # dynamic one is evaluated before the dispatch inputs are available), so
+    # the unrequested leg skips itself here instead of building.
+    if: >-
+      github.event_name == 'push' ||
+      inputs.arch == '' ||
+      contains(',' + inputs.arch + ',', ',' + matrix.arch + ',')
     strategy:
       fail-fast: false
       matrix:
-        # The dispatch input picks the legs. The emulated arm64 build on an
-        # x64 runner is slow (the upstream uses native ARM runners, which the
-        # fork has no access to), so a single-arch dispatch is supported.
-        arch: ${{ fromJSON(inputs.arch || '["amd64","arm64"]') }}
+        # The upstream builds arm64 on a native ARM runner; the fork has no
+        # access to one, so the arm64 leg runs emulated on the x64 runner and
+        # takes far longer than the amd64 leg. The dispatch may therefore ask
+        # for a single architecture. The matrix is a plain 2x2 and the jobs
+        # skip themselves when their leg was not requested — a dynamic
+        # `fromJSON(inputs.arch)` matrix would be evaluated before the
+        # inputs are available and yields no jobs at all.
+        arch: [amd64, arm64]
         variant: [slim]
         include:
           - arch: amd64
@@ -131,9 +142,80 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "::notice::pushed ${{ matrix.arch }} -> $digest"
 
+      # A container package is PRIVATE by default. The deploy host pulls the
+      # image by digest with no registry credential, so the package must be
+      # public for the anonymous token to be issued — the same posture as the
+      # public upstream registry. This runs in the build job because the
+      # package exists as soon as the first image lands, and it must not
+      # depend on the manifest job (which a single-arch dispatch skips).
+      - name: Make the package public so an anonymous pull works
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_type="$(curl -sS -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/users/${GITHUB_REPOSITORY_OWNER}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))')"
+          case "$owner_type" in
+            Organization) path="orgs/${GITHUB_REPOSITORY_OWNER}" ;;
+            User)         path="users/${GITHUB_REPOSITORY_OWNER}" ;;
+            *) echo "::error::Unknown owner type: $owner_type"; exit 1 ;;
+          esac
+          echo "owner endpoint: ${path}"
+          for attempt in 1 2 3 4 5; do
+            code="$(curl -sS -o /tmp/visibility.json -w '%{http_code}' -X PATCH \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/${path}/packages/container/hermes-agent/visibility" \
+              -d '{"visibility":"public"}')"
+            echo "visibility PATCH attempt ${attempt}: HTTP ${code}"
+            if [ "$code" = 200 ]; then break; fi
+            cat /tmp/visibility.json
+            if [ "$attempt" = 5 ]; then echo "::error::could not set visibility"; exit 1; fi
+            sleep 15
+          done
+          cat /tmp/visibility.json
+
+      - name: Prove the anonymous pull works
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            token="$(curl -sS \
+              "https://ghcr.io/token?scope=repository:easytrondev/hermes-agent:pull&service=ghcr.io" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
+            if [ -n "$token" ]; then
+              echo "::notice::anonymous pull token issued on attempt ${attempt}"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${token}" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                "https://ghcr.io/v2/easytrondev/hermes-agent/manifests/${TAG}-${ARCH}")"
+              echo "manifest HTTP ${code}"
+              test "$code" = 200 || { echo "::error::manifest not pullable anonymously"; exit 1; }
+              exit 0
+            fi
+            echo "::warning::anonymous token not issued yet (attempt ${attempt})"
+            sleep 10
+          done
+          echo "::error::anonymous pull never became available"
+          exit 1
+
   manifest:
     name: Assemble multi-arch manifest
     needs: [build]
+    # Only assemble the manifest when every requested leg actually built. A
+    # skipped leg (a single-arch dispatch) leaves no member to add.
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (github.event_name == 'push' || inputs.arch == '' ||
+       (contains(',' + inputs.arch + ',', ',amd64,') &&
+        contains(',' + inputs.arch + ',', ',arm64,')))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -211,45 +293,16 @@ jobs:
           done
           echo "::notice::every leg carries org.opencontainers.image.revision=${CANDIDATE_COMMIT}"
 
-      # A container package is PRIVATE by default. The deploy host pulls the
-      # image by digest with no registry credential, so the package must be
-      # public for the anonymous token to be issued — the same posture as the
-      # public upstream registry. The owner is an organization, so the
-      # org-scoped endpoint is the one that applies.
-      - name: Make the package public so an anonymous pull works
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          owner_type="$(curl -sS -H "Authorization: token ${GH_TOKEN}" \
-            "https://api.github.com/users/${GITHUB_REPOSITORY_OWNER}" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))')"
-          case "$owner_type" in
-            Organization) path="orgs/${GITHUB_REPOSITORY_OWNER}" ;;
-            User)         path="users/${GITHUB_REPOSITORY_OWNER}" ;;
-            *) echo "::error::Unknown owner type: $owner_type"; exit 1 ;;
-          esac
-          echo "owner endpoint: ${path}"
-          for attempt in 1 2 3; do
-            code="$(curl -sS -o /tmp/visibility.json -w '%{http_code}' -X PATCH \
-              -H "Authorization: token ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/${path}/packages/container/hermes-agent/visibility" \
-              -d '{"visibility":"public"}')"
-            echo "visibility PATCH attempt ${attempt}: HTTP ${code}"
-            if [ "$code" = 200 ]; then break; fi
-            cat /tmp/visibility.json
-            if [ "$attempt" = 3 ]; then echo "::error::could not set visibility"; exit 1; fi
-            sleep 15
-          done
-          cat /tmp/visibility.json
-
-      - name: Prove the anonymous pull works
+      # The visibility flip and the per-leg anonymous-pull proof live in the
+      # build job (the package exists as soon as the first image lands). This
+      # job proves the FINAL artifact — the multi-arch tag the compose will
+      # reference — is anonymously pullable too.
+      - name: Prove the multi-arch manifest is anonymously pullable
         env:
           TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
         run: |
           set -euo pipefail
-          for attempt in 1 2 3 4 5; do
+          for attempt in 1 2 3 4 5 6; do
             token="$(curl -sS \
               "https://ghcr.io/token?scope=repository:easytrondev/hermes-agent:pull&service=ghcr.io" \
               | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
