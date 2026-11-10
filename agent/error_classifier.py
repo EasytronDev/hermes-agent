@@ -15,7 +15,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
-from agent.credential_pool_validation import FAILURE_CAUSE_INVALID_API_KEY
+from agent.credential_pool_validation import (
+    FAILURE_CAUSE_INVALID_API_KEY,
+    FAILURE_CAUSE_POOL_CREDENTIAL_INVALID,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1075,8 +1078,49 @@ def classify_api_error(
         # from a wall no retry heals (leave it parked). A 401 means a key WAS sent and the
         # provider refused it; the runtime's own refusal (no key at all) never reaches here —
         # it is an ``AuthError`` with code ``missing_api_key``.
-        classified.error_context.setdefault("failure_cause", FAILURE_CAUSE_INVALID_API_KEY)
+        cause = _credential_failure_cause(provider, api_key)
+        classified.error_context.setdefault("failure_cause", cause)
     return classified
+
+
+def _credential_failure_cause(provider: str, api_key: Any) -> str:
+    """Which credential failure this is: a defective pool row, or the key itself.
+
+    ``pool_credential_invalid`` — the key that was sent is a credential-pool row that
+    cannot be a key for this provider (judged against the pool's own owner-provided
+    credential). The remedy is to fix the pool, not to rotate the key.
+
+    ``invalid_api_key`` — a key was sent and the provider refused it.
+
+    The pool's own selection rule already refuses to LEASE such a row, so this branch
+    covers what that rule cannot reach: a store written before the check existed, or one
+    written by a tool that never had it (2026-11-10: two 20-character ``manual`` rows
+    ahead of the real key in one profile's pool, and the board could not tell "the pool
+    holds a malformed row" from "the key is wrong").
+    """
+    if not provider or not api_key:
+        return FAILURE_CAUSE_INVALID_API_KEY
+    try:
+        from hermes_cli.auth import read_credential_pool
+        from agent.credential_pool_validation import (
+            manual_pool_credential_defect, reference_credential_length,
+        )
+
+        rows = read_credential_pool(provider)
+        if not rows:
+            return FAILURE_CAUSE_INVALID_API_KEY
+        reference = reference_credential_length(rows)
+        for row in rows:
+            secret = row.get("access_token") if isinstance(row, dict) else None
+            if not isinstance(secret, str) or not secret or secret != api_key:
+                continue
+            if manual_pool_credential_defect(provider, row, reference_length=reference) is not None:
+                return FAILURE_CAUSE_POOL_CREDENTIAL_INVALID
+            break
+    except Exception:  # noqa: BLE001
+        # The pool is not readable here; the generic cause still holds.
+        return FAILURE_CAUSE_INVALID_API_KEY
+    return FAILURE_CAUSE_INVALID_API_KEY
 
 
 def _off_route_host(c: _Ctx) -> str:

@@ -259,6 +259,75 @@ def test_the_cause_codes_are_stable_tokens():
     assert FAILURE_CAUSE_POOL_CREDENTIAL_INVALID == "pool_credential_invalid"
 
 
+def test_a_401_on_a_defective_pool_row_is_named_pool_credential_invalid(tmp_path, monkeypatch):
+    """The rejected key came from a malformed pool row: the cause says THAT.
+
+    The generic ``invalid_api_key`` says "rotate the key"; this one says "the pool holds
+    a row that cannot be a key". A board promotes the first when the cause was corrected
+    and leaves the second parked, so the distinction is the point of the code.
+    """
+    _hermetic_profile(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _incident_pool())
+    from agent.error_classifier import classify_api_error
+
+    class _FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {"error": {"message": "login fail: Please carry the API secret key"}}
+
+    class _FakeError(Exception):
+        status_code = 401
+        response = _FakeResponse()
+
+    # The key that was sent IS the malformed row's secret.
+    classified = classify_api_error(_FakeError("401 unauthorized"), provider="minimax",
+                                    api_key=BAD_SECRET)
+    assert classified.is_auth
+    assert classified.failure_cause == "pool_credential_invalid"
+
+
+def test_a_401_on_the_configured_key_stays_invalid_api_key(tmp_path, monkeypatch):
+    """The key that was sent is the profile's own: the remedy is to rotate it."""
+    _hermetic_profile(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _incident_pool())
+    from agent.error_classifier import classify_api_error
+
+    class _FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {"error": {"message": "login fail"}}
+
+    class _FakeError(Exception):
+        status_code = 401
+        response = _FakeResponse()
+
+    classified = classify_api_error(_FakeError("401 unauthorized"), provider="minimax",
+                                    api_key=GOOD_SECRET)
+    assert classified.failure_cause == "invalid_api_key"
+
+
+def test_a_401_with_an_unreadable_pool_stays_invalid_api_key(tmp_path, monkeypatch):
+    """No readable pool: the generic cause holds (the board must not be told a lie)."""
+    _hermetic_profile(tmp_path, monkeypatch)
+    from agent.error_classifier import classify_api_error
+
+    class _FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {"error": {"message": "login fail"}}
+
+    class _FakeError(Exception):
+        status_code = 401
+        response = _FakeResponse()
+
+    classified = classify_api_error(_FakeError("401 unauthorized"), provider="minimax",
+                                    api_key="some-key")
+    assert classified.failure_cause == "invalid_api_key"
+
+
 def test_a_malformed_manual_row_reports_the_pool_cause():
     """The pool row's own defect carries the ``pool_credential_invalid`` code."""
     from agent.credential_pool_validation import manual_pool_credential_defect
