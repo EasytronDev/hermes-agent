@@ -189,6 +189,66 @@ jobs:
           test "$revision" = "$CANDIDATE_COMMIT" || {
             echo "::error::revision label $revision != candidate $CANDIDATE_COMMIT"; exit 1; }
 
+      # A container package is PRIVATE by default. The deploy host pulls the
+      # image by digest with no registry credential, so the package must be
+      # public for the anonymous token to be issued — the same posture as the
+      # public upstream registry. The owner is an organization, so the
+      # org-scoped endpoint is the one that applies.
+      - name: Make the package public so an anonymous pull works
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_type="$(curl -sS -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/users/${GITHUB_REPOSITORY_OWNER}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))')"
+          case "$owner_type" in
+            Organization) path="orgs/${GITHUB_REPOSITORY_OWNER}" ;;
+            User)         path="users/${GITHUB_REPOSITORY_OWNER}" ;;
+            *) echo "::error::Unknown owner type: $owner_type"; exit 1 ;;
+          esac
+          echo "owner endpoint: ${path}"
+          for attempt in 1 2 3; do
+            code="$(curl -sS -o /tmp/visibility.json -w '%{http_code}' -X PATCH \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/${path}/packages/container/hermes-agent/visibility" \
+              -d '{"visibility":"public"}')"
+            echo "visibility PATCH attempt ${attempt}: HTTP ${code}"
+            if [ "$code" = 200 ]; then break; fi
+            cat /tmp/visibility.json
+            if [ "$attempt" = 3 ]; then echo "::error::could not set visibility"; exit 1; fi
+            sleep 15
+          done
+          cat /tmp/visibility.json
+
+      - name: Prove the anonymous pull works
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            token="$(curl -sS \
+              "https://ghcr.io/token?scope=repository:easytrondev/hermes-agent:pull&service=ghcr.io" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
+            if [ -n "$token" ]; then
+              echo "::notice::anonymous pull token issued on attempt ${attempt}"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${token}" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/easytrondev/hermes-agent/manifests/${TAG}")"
+              echo "manifest HTTP ${code}"
+              test "$code" = 200 || { echo "::error::manifest not pullable anonymously"; exit 1; }
+              exit 0
+            fi
+            echo "::warning::anonymous token not issued yet (attempt ${attempt})"
+            sleep 10
+          done
+          echo "::error::anonymous pull never became available"
+          exit 1
+
       - name: Publish the digest as a job output
         id: receipt
         run: |
