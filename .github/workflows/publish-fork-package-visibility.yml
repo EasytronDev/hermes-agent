@@ -66,9 +66,16 @@ jobs:
           endpoint="https://api.github.com/${OWNER_PATH}/packages/container/${PACKAGE}/visibility"
           echo "endpoint: ${endpoint}"
           done_flag=0
+          # The env var names and the token values are kept in two parallel
+          # lists: bash cannot indirect-expand a variable named by another
+          # variable's VALUE through `${!name}` when the name is derived at
+          # runtime, so the pairs are walked explicitly.
           for label in GITHUB_TOKEN PAT; do
-            token_var="$label"
-            token="${!token_var:-}"
+            case "$label" in
+              GITHUB_TOKEN) token="${GH_TOKEN:-}" ;;
+              PAT)         token="${PAT:-}" ;;
+              *)           token="" ;;
+            esac
             if [ -z "$token" ]; then
               echo "::notice::${label} is not available, skipping"
               continue

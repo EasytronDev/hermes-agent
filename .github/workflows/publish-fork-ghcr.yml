@@ -38,7 +38,11 @@ permissions:
 
 concurrency:
   group: publish-fork-ghcr-${{ github.ref }}
-  cancel-in-progress: false
+  # A new push cancels the previous run instead of queueing behind it: on the
+  # fork's free plan the concurrent-runner limit is small, and a queued run
+  # that is superseded still occupies the queue until it is cancelled by
+  # hand.
+  cancel-in-progress: true
 
 env:
   # The fork's own namespace on GHCR. NOT nousresearch/* — that is upstream's.
@@ -177,7 +181,11 @@ jobs:
           esac
           endpoint="https://api.github.com/${path}/packages/container/hermes-agent/visibility"
           for label in GITHUB_TOKEN PAT; do
-            token="${!label:-}"
+            case "$label" in
+              GITHUB_TOKEN) token="${GH_TOKEN:-}" ;;
+              PAT)         token="${PAT:-}" ;;
+              *)           token="" ;;
+            esac
             [ -n "$token" ] || continue
             code="$(curl -sS -o /tmp/visibility.json -w '%{http_code}' -X PATCH \
               -H "Authorization: token ${token}" \
