@@ -639,11 +639,11 @@ CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
 -- (hermes_state_runtime_workers.worker_states), whose WHERE clause lists exactly the
 -- non-terminal statuses. That index is not covering -- it carries status but not
 -- session_id -- so each matching row costs a table lookup: measured on 300k
--- executions the lineage probe went from 1,36 ms to 75,12 ms (55x) and its plan
+-- executions the lineage probe went from 1,36 ms to 83,80 ms (61x) and its plan
 -- changed from "USING COVERING INDEX idx_worker_executions_session_status" to
 -- "USING INDEX idx_worker_executions_status". The partial index holds only the
 -- non-terminal rows, so it never displaces the covering index for the lineage
--- probe (measured: plan stays on the covering index, 1,56 ms) while still serving
+-- probe (measured: plan stays on the covering index, 1,21 ms) while still serving
 -- the status-only probes (the gateway's "is a managed worker live" check,
 -- status != 'terminal') as an indexed lookup.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_status

@@ -323,8 +323,8 @@ class TestWorkerExecutionsStatusIndex:
         A full (status) index also carries every terminal row, and the planner
         then prefers it for the lineage probe -- whose WHERE clause lists
         exactly the non-terminal statuses -- even though that index is not
-        covering. Measured on 300k executions, the lineage probe went from
-        1,36 ms to 75,12 ms and its plan changed from the covering
+        covering. Measured on 300k executions the lineage probe went from
+        1,36 ms to 83,80 ms (61x) and its plan changed from the covering
         (session_id, status) index to a non-covering (status) one.
         """
         from hermes_state_common import SCHEMA_SQL
