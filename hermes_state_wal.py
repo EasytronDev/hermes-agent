@@ -30,6 +30,12 @@ _WAL_INCOMPAT_MARKERS = ("locking protocol", "not authorized", "disk i/o error")
 # SQLite's default journal_size_limit is -1 (unlimited); see _apply_wal_size_limit.
 _WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 64 MiB
 
+# How many pages one `incremental_vacuum()` call may give back. Each PRAGMA call
+# frees exactly ONE page (measured on SQLite 3.53.1), so this is how many calls
+# the loop makes. 200.000 pages is ~800 MB at the 4 KiB page size -- far more
+# than any single store's freelist, and a bounded loop for a pathological one.
+_INCREMENTAL_VACUUM_MAX_PAGES = 200_000
+
 # Once-per-process-per-db_label dedup sets (kanban_db.connect() runs on every kanban operation, so an undeduped
 # line would repeat per connection). Tests clear these via ``hermes_state_wal.<name>``.
 _wal_fallback_warned_paths: set[str] = set()
@@ -641,14 +647,145 @@ def _apply_synchronous_pragma(conn: sqlite3.Connection, raw_value: Any, *, db_la
         conn.execute(f"PRAGMA synchronous={level}")
 
 
+def _auto_vacuum_level_name(level: int) -> str:
+    """SQLite's name for an ``auto_vacuum`` level (0 = NONE, 1 = FULL, 2 = INCREMENTAL)."""
+    return {0: "NONE", 1: "FULL", 2: "INCREMENTAL"}.get(level, str(level))
+
+
+def apply_auto_vacuum(conn: sqlite3.Connection, level: int, *, db_label: str = "state.db") -> bool:
+    """Set ``PRAGMA auto_vacuum`` and report whether it ACTUALLY took effect.
+
+    ``auto_vacuum`` is a property of the FILE, not of the connection, and SQLite
+    only honours a change on it when the database is created empty or when a
+    ``VACUUM`` rewrites every page. On a populated store the PRAGMA is accepted
+    and silently does nothing — the header still says the old mode. A caller
+    that trusted the "no exception" would believe the free pages now come back
+    automatically, and they would not.
+
+    So this returns the VERIFIED state: it reads ``PRAGMA auto_vacuum`` back and
+    reports the difference, and when the mode did not change it says what
+    actually makes it change (a VACUUM) instead of pretending it worked.
+
+    With ``auto_vacuum=INCREMENTAL`` the store can return a freed page to the
+    file without a full rewrite -- but only when ``PRAGMA incremental_vacuum``
+    actually runs. Measured on SQLite 3.53.1: with INCREMENTAL set, a DELETE
+    that frees two pages leaves ``freelist_count = 2`` and the file the same
+    size; the space comes back when ``incremental_vacuum`` runs, and a full
+    ``VACUUM`` also does it (it rewrites the file anyway). So INCREMENTAL is
+    the mode that makes the reclaim CHEAP, not the mode that performs it.
+    """
+    if level not in (0, 1, 2):
+        logger.warning("%s: ignoring out-of-range database.auto_vacuum=%r (expected 0, 1 or 2)",
+                       db_label, level)
+        return False
+    try:
+        before = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("%s: could not read auto_vacuum: %s", db_label, exc)
+        return False
+    if before == level:
+        return True
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(f"PRAGMA auto_vacuum={level}")
+    try:
+        after = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("%s: could not read auto_vacuum back: %s", db_label, exc)
+        return False
+    if after == level:
+        return True
+    # The PRAGMA was accepted but the file's mode did not change: the store is
+    # populated, and SQLite only rewrites the header during a VACUUM.
+    logger.warning(
+        "%s: auto_vacuum=%s did NOT take effect (the file is still %s) — SQLite only honours a "
+        "change on a populated database during a VACUUM. Run `hermes sessions optimize` (or the "
+        "retention job's VACUUM) once, and the mode sticks from then on.",
+        db_label, _auto_vacuum_level_name(level), _auto_vacuum_level_name(after))
+    return False
+
+
+def incremental_vacuum(conn: sqlite3.Connection, *, db_label: str = "state.db") -> int:
+    """Return the free pages to the file with ``PRAGMA incremental_vacuum``; returns the count.
+
+    This is the CHEAP reclaim: it moves free pages to the end of the file and
+    truncates, without rewriting every page the way ``VACUUM`` does. On a
+    1,88 GB store with 86.669 free pages it is the difference between a 10 s
+    full rewrite and a truncation.
+
+    It only works when the file's ``auto_vacuum`` is ``INCREMENTAL`` (2).
+    SQLite accepts the PRAGMA on a ``NONE`` store and does nothing, so this
+    reads the mode back and refuses to claim a reclaim that did not happen --
+    the caller can then fall back to a real ``VACUUM``.
+
+    Measured on SQLite 3.53.1: ``PRAGMA incremental_vacuum`` frees exactly ONE
+    page per call -- with NO argument and with a count alike (the count is the
+    BUDGET, not a batch size: freelist 20 -> 19 -> 18, the file one page
+    smaller each time). To give a whole freelist back the PRAGMA has to be
+    issued repeatedly, so this loops until the freelist stops shrinking or the
+    page budget is spent. A single ``VACUUM`` reclaims the same pages in one
+    rewrite; the difference is that the rewrite copies every live page.
+
+    Returns the number of free pages reclaimed (0 when the mode is not
+    INCREMENTAL, when the store holds no free pages, or when the PRAGMA
+    failed).
+    """
+    try:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("%s: could not read auto_vacuum: %s", db_label, exc)
+        return 0
+    if mode != 2:
+        logger.warning(
+            "%s: incremental_vacuum needs auto_vacuum=INCREMENTAL (the file is %s) -- SQLite accepts "
+            "the PRAGMA on a NONE store and reclaims nothing. Use a full VACUUM, or set "
+            "database.auto_vacuum: 2 and VACUUM once so the mode sticks.",
+            db_label, _auto_vacuum_level_name(mode))
+        return 0
+    try:
+        before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("%s: could not read freelist_count: %s", db_label, exc)
+        return 0
+    if not before:
+        return 0
+    reclaimed = 0
+    # Each call frees exactly one page, so the loop is the work. The budget stops
+    # a pathological store from spinning here; a store with more free pages than
+    # the budget keeps them and the caller can fall back to a full VACUUM.
+    for _ in range(min(int(before), _INCREMENTAL_VACUUM_MAX_PAGES)):
+        try:
+            conn.execute("PRAGMA incremental_vacuum")
+        except sqlite3.OperationalError as exc:
+            logger.warning("%s: incremental_vacuum failed: %s", db_label, exc)
+            break
+        try:
+            now = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        except sqlite3.OperationalError:  # pragma: no cover - defensive
+            break
+        if now >= before - reclaimed:
+            break  # no progress: the remaining pages are not reclaimable this way
+        reclaimed = before - now
+    if reclaimed:
+        logger.info("%s: incremental_vacuum reclaimed %d free page(s)", db_label, reclaimed)
+    return reclaimed
+
+
 def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.db") -> None:
     """Apply optional performance and WAL-sizing PRAGMAs from ``config.yaml``.
 
     Journal mode is NOT handled here (owned by :func:`apply_wal_with_fallback`). ``database:`` keys: ``cache_size``
     (negative = KiB, positive = pages), ``mmap_size`` (bytes, 0 = off), ``temp_store`` (0-3), ``wal_autocheckpoint``
     (pages), ``journal_size_limit`` (bytes), ``synchronous`` (unset leaves the compile-time default, which differs
-    between bundled/distro/Homebrew builds). Best-effort: failures are ignored so DB init never breaks on a
-    malformed section. Applied to ALL connection types: writer, read_only, WAL readers."""
+    between bundled/distro/Homebrew builds), ``auto_vacuum`` (0 = NONE, 1 = FULL, 2 = INCREMENTAL), ``optimize_on_open``
+    (bool: run ``PRAGMA optimize`` when a writer connection opens). Best-effort: failures are ignored so DB init never
+    breaks on a malformed section. Applied to ALL connection types: writer, read_only, WAL readers.
+
+    ``auto_vacuum`` is the one PRAGMA here that does NOT take effect on an existing
+    database: SQLite only honours it when the store is created empty, or after a
+    ``VACUUM`` rewrites the file. Setting it on a populated store is a silent no-op,
+    so :func:`apply_auto_vacuum` refuses to claim success on a store whose
+    ``auto_vacuum`` did not actually change, and says what to do about it.
+    """
     try:
         from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids a circular import
         cfg = load_config_readonly()
@@ -664,6 +801,21 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
             continue
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"PRAGMA {pragma_name}={value}")
+    # auto_vacuum is NOT a per-connection knob: it is a property of the file, and it
+    # only changes on a fresh store or after a VACUUM. Handled separately so the
+    # "did it actually take?" check can report the truth.
+    if (raw_auto_vacuum := cfg_get(cfg, "database", "auto_vacuum", default=None)) is not None:
+        try:
+            apply_auto_vacuum(conn, int(str(raw_auto_vacuum).strip()), db_label=db_label)
+        except (TypeError, ValueError):
+            logger.warning("%s: ignoring non-integer database.auto_vacuum=%r", db_label, raw_auto_vacuum)
+    # PRAGMA optimize (ANALYZE) refreshes the planner's statistics. Without it the
+    # planner works off whatever ANALYZE last wrote, and a table that grew since
+    # (worker_executions, worker_receipts) keeps a stale row count -> the planner
+    # picks the wrong plan. Cheap on a small store; a no-op when the stats are fresh.
+    if bool(cfg_get(cfg, "database", "optimize_on_open", default=False)):
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("PRAGMA optimize")
     # Last: sizing pragmas cannot change durability (see _apply_synchronous_pragma).
     if (raw_synchronous := cfg_get(cfg, "database", "synchronous", default=None)) is not None:
         _apply_synchronous_pragma(conn, raw_synchronous, db_label=db_label)

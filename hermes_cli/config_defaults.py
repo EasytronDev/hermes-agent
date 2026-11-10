@@ -35,6 +35,14 @@ DEFAULT_CONFIG = {
         # WAL sizing pragmas (ints). None = SQLite defaults (autocheckpoint 1000 pages, no limit).
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
+        # auto_vacuum: 0 = NONE (default), 1 = FULL, 2 = INCREMENTAL. SQLite only honours a
+        # change on a populated store during a VACUUM, so setting this on an existing
+        # profile's state.db does nothing until a VACUUM rewrites the file. With
+        # INCREMENTAL a freed page returns to the file on the next commit.
+        "auto_vacuum": None,
+        # optimize_on_open: run `PRAGMA optimize` (ANALYZE) when a connection opens, so the
+        # planner's statistics follow the tables that grew since the last ANALYZE.
+        "optimize_on_open": False,
     },
     # Server-process fd soft limit (clamped to the hard limit) + glibc arena cap; 0/false/null = off.
     "runtime": {"nofile_soft_limit": 4096, "malloc_arena_max": 4},

@@ -629,6 +629,13 @@ CREATE TABLE IF NOT EXISTS worker_executions (
 -- inside the write transaction; without this each probe scanned the whole (only-growing) table.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
     ON worker_executions(session_id, status);
+-- Status-only probes (the retention sweep's "receipts of a terminal execution", the
+-- runtime's orphan-receipt check) filter on status with no session_id, so the
+-- (session_id, status) index above cannot serve them: SQLite fell back to a SCAN of
+-- worker_executions. That table grows by one row per worker run, so the scan grows
+-- with it. A status-leading index turns the probe into a SEARCH.
+CREATE INDEX IF NOT EXISTS idx_worker_executions_status
+    ON worker_executions(status);
 CREATE TABLE IF NOT EXISTS worker_receipts (
     execution_id TEXT NOT NULL REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence > 0),

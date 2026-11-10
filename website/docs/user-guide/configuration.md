@@ -138,6 +138,25 @@ database:
   # Optional WAL sizing pragmas (integers). Unset = SQLite defaults.
   # wal_autocheckpoint: 1000     # pages between automatic checkpoints
   # journal_size_limit: 67108864 # cap the WAL/journal size in bytes
+
+  # Optional cache/mmap sizing (integers). Unset = SQLite defaults.
+  # cache_size: -262144          # negative = KiB, positive = pages
+  # mmap_size: 268435456         # bytes; 0 = off
+
+  # auto_vacuum: 0 = NONE (default), 1 = FULL, 2 = INCREMENTAL. With
+  # INCREMENTAL a page freed by a delete returns to the file on the next
+  # commit, so a store that grows and prunes continuously stops hoarding
+  # the freed space. SQLite only honours a change on an existing database
+  # during a VACUUM, so on a populated store this does nothing until one
+  # runs — Hermes logs that it did not take effect and names the command.
+  # auto_vacuum: 2
+
+  # optimize_on_open: true runs `PRAGMA optimize` (ANALYZE) when a
+  # connection opens, so the planner's statistics follow the tables that
+  # grew since the last ANALYZE. Off by default: on a large store the
+  # ANALYZE pass is not free, and the periodic maintenance job runs it
+  # anyway.
+  # optimize_on_open: false
 ```
 
 Hermes also warns (once per process per database) when an existing
@@ -154,6 +173,15 @@ holds the file and verifies the converted header). Under that warning it names t
 processes currently holding the database (`<db> is held by PID <n> (<command>)`)
 so you know what to stop; when the holder scan is partial or unavailable it says
 `cannot prove the database is quiet` instead of giving an all-clear.
+
+`database.auto_vacuum` and `database.optimize_on_open` are the two hygiene
+knobs. `database.auto_vacuum` is `NONE` by default, which means a page freed by
+a delete stays free **forever** — the file never shrinks on its own, and a
+store that churns (delete old rows, write new ones) grows without bound.
+`database.optimize_on_open` runs `PRAGMA optimize` (ANALYZE) on open so the
+planner's statistics follow the tables that grew since the last ANALYZE; it is
+off by default because the ANALYZE pass costs time on a large store and the
+periodic maintenance job runs it anyway.
 
 ## Environment Variable Substitution
 
