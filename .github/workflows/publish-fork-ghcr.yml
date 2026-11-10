@@ -251,6 +251,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
           ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           # The package is private until someone with `admin:packages` flips
@@ -258,26 +259,34 @@ jobs:
           # carry that scope). A registry credential on the deploy host is
           # the other supported path, so the image must be proven readable
           # with a credential — the same way the deploy host will read it.
-          token="$(curl -sS -u "${GITHUB_ACTOR}:${GH_TOKEN}" \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:easytrondev/hermes-agent:pull" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
-          if [ -z "$token" ]; then
-            echo "::warning::no credentialed pull token was issued"
-            exit 0
-          fi
-          code="$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${token}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json' \
-            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-            "https://ghcr.io/v2/easytrondev/hermes-agent/manifests/${TAG}-${ARCH}")"
-          echo "credentialed manifest HTTP ${code}"
-          if [ "$code" = 200 ]; then
-            echo "::notice::the image is pullable WITH a registry credential"
-          else
-            echo "::warning::the credentialed pull also answered HTTP ${code}"
-          fi
+          #
+          # The docker login already performed by this job left a credential
+          # in the runner's docker config, so the credentialed pull is proved
+          # against the registry itself, not against the token endpoint.
+          digest="$(docker buildx imagetools inspect \
+            "${IMAGE_NAME}:${TAG}-${ARCH}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::warning::could not read the image back with a credential (${digest})"; exit 0 ;;
+          esac
+          echo "::notice::the image is pullable WITH a registry credential: ${TAG}-${ARCH}@${digest}"
+
+      - name: Record the published digest as a job output
+        id: leg
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
+        env:
+          TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          digest="$(docker buildx imagetools inspect \
+            "${IMAGE_NAME}:${TAG}-${ARCH}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "arch=${ARCH}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   manifest:
     name: Assemble multi-arch manifest
