@@ -3104,48 +3104,12 @@ class ContextCompressor(
                     self._fallback_compression_streak,
                     max(0.0, self._anti_thrash_recovery_deadline - _now),
                 )
-            # OVERFLOW ESCAPE HATCH: the block above is a cost guard (do not re-pay for a
-            # compaction that cannot shrink anything). It must NOT become the CAUSE of an
-            # overflow: while it blocks, nothing bounds the request, and the transcript keeps
-            # being re-sent every turn. Measured on the fleet: all 6 sessions with
-            # compression_ineffective_count >= 2 ended ws_orphan_reap, 129.8s-267.2s after the
-            # breaker armed — every one of them died BEFORE the 300s probation probe could
-            # fire, so the "one probe per window" recovery never ran.
-            # Past the provider's own window there is nothing left to protect: a rejected
-            # request costs the same as a rejected compaction, and the session is already
-            # headed for ws_orphan_reap. Let the compaction run.
-            if self._request_past_provider_window():
-                if not self.quiet_mode:
-                    logger.warning(
-                        "Anti-thrash block bypassed: the request is past the provider context "
-                        "window (context=%s) — compacting now rather than riding into an "
-                        "overflow (ineffective=%d).",
-                        f"{getattr(self, 'context_length', 0):,}",
-                        self._ineffective_compression_count,
-                    )
+            if self._anti_thrash_bypass_allowed():
                 return False
             return True
         # Guard not tripped: disarm any pending clock so a later trip starts a full window.
         self._set_anti_thrash_recovery_deadline(0.0)
         return False
-
-    def _request_past_provider_window(self) -> bool:
-        """True when the last real prompt already exceeds the provider's context window.
-
-        The anti-thrash breaker exists to stop paying for compactions that cannot shrink
-        anything. It is not a safety mechanism against the provider's hard limit, and it
-        must never become one: while the breaker holds, the request grows unbounded.
-        This predicate is the escape hatch — it only opens once the session is already
-        past the point where the provider will reject the request, so the cheaper failure
-        (a compaction attempt) is preferred over the certain one (an overflow).
-        """
-        window = int(getattr(self, "context_length", 0) or 0)
-        if window <= 0:
-            return False
-        last = int(getattr(self, "last_real_prompt_tokens", 0) or 0)
-        if last <= 0:
-            last = int(getattr(self, "last_prompt_tokens", 0) or 0)
-        return last > window
 
     def _walk_tail_budget(
         self, messages: list[dict[str, Any]], head_end: int, ceiling: int, min_tail: int, *, cut_at_break: bool,
@@ -3603,12 +3567,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
         summary = self._augment_summary_lean(summary, turns_to_summarize)
-        # The lean augmentation APPENDS the anchor index and the verbatim user
-        # messages, so the fallback's own cap no longer bounds the artifact.
-        # Apply the same declared ceiling the LLM path now enforces, otherwise the
-        # deterministic fallback (the path that runs when the summary model is down)
-        # reproduces the same unbounded-summary overflow.
-        return self._bound_summary_output(summary, self.max_summary_tokens * _CHARS_PER_TOKEN)
+        return self._capped_summary(summary)
 
     def _demote_stale_tail_tools(self, messages: list[dict[str, Any]], tail_start: int) -> list[dict[str, Any]]:
         """Lean mode: demote stale tail tool results to recovery stubs (``demote_stale_tail_tools``)."""
@@ -3629,41 +3588,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if heading not in summary:
                 summary += build()
         return summary
-
-    @classmethod
-    def _bound_summary_output(cls, content: str, max_chars: int) -> str:
-        """Cap the ASSEMBLED summary, keeping head and tail and marking the omitted middle.
-
-        ``max_summary_tokens`` was only ever a PROMPT GUIDANCE for the summarizer call
-        (``_compute_summary_budget`` -> the ``summary_budget`` line in the prompt). Nothing
-        bounded the text that came BACK, so a summarizer that ignored the guidance — or an
-        iterative update that quoted the PREVIOUS summary, which the prompt asks it to
-        "PRESERVE all existing information" — produced a summary far above the declared
-        ceiling. Measured on the fleet: 90.3% of stored summaries exceeded the 40,000-char
-        (10,000-token) ceiling, the worst at 432,166 chars (108,041 tokens).
-
-        A single summary that large IS the live context: with the trigger at 153,600 tokens
-        (0.75 of a 204,800 window), one 106,004-token summary left the compaction unable to
-        clear its own threshold. Every pass was then scored "ineffective", two strikes
-        tripped the anti-thrash breaker, and the breaker suppressed compaction for
-        ``_ANTI_THRASH_RECOVERY_SECONDS`` while the request kept growing — the overflow
-        that killed card t_5a6c1faf (all 6 sessions with a tripped breaker ended
-        ``ws_orphan_reap``).
-
-        The head/tail split favours the TAIL: the tail of a handoff carries the most recent
-        state ("Active Task", "In Progress"), and the head carries the preamble that frames
-        it. The elision marker says what was dropped so the model knows the summary is
-        partial rather than complete.
-        """
-        if max_chars <= 0 or len(content) <= max_chars:
-            return content
-        marker = "\n\n...[summary truncated by the size guard]...\n\n"
-        keep = max(max_chars - len(marker), 0)
-        head_chars = int(keep * 0.45)
-        tail_chars = keep - head_chars
-        head = content[:head_chars].rstrip()
-        tail = content[-tail_chars:].lstrip() if tail_chars else ""
-        return head + marker + tail
 
     @classmethod
     def _bound_summary_input(cls, content: str) -> str:
@@ -4008,13 +3932,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
             _raise_if_stale_attempt(self)
             self._record_summary_success(summary)
-            # Enforce the declared summary budget on the ASSEMBLED artifact. Without this the
-            # ceiling was only prompt guidance: a summarizer that ignored it, or an iterative
-            # update that quoted the previous summary, could return a summary of ANY size.
-            # The bound runs AFTER _with_summary_prefix so the handoff preamble is inside the
-            # cap, and AFTER _augment_summary_lean so the appended sections are inside it too.
             handoff = self._with_summary_prefix(summary)
-            return self._bound_summary_output(handoff, self.max_summary_tokens * _CHARS_PER_TOKEN)
+            return self._capped_summary(handoff)
         except Exception as e:  # health: allow BLE001 -- unchanged summary boundary: every failure goes to _on_summary_failure
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
 

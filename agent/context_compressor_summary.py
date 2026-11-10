@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 
 if TYPE_CHECKING:
     from agent.context_compressor import _HandoffScan
+
+logger = logging.getLogger(__name__)
 
 
 def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
@@ -106,3 +109,88 @@ class SummaryDispatchMixin:
                 self._previous_summary = scan.previous_summary_before
                 self._summary_has_user_turn = scan.has_user_turn_before
             raise
+
+    @classmethod
+    def _bound_summary_output(cls, content: str, max_chars: int) -> str:
+        """Cap the ASSEMBLED summary, keeping head and tail and marking the omitted middle.
+
+        ``max_summary_tokens`` was only ever a PROMPT GUIDANCE for the summarizer call
+        (``_compute_summary_budget`` -> the ``summary_budget`` line in the prompt). Nothing
+        bounded the text that came BACK, so a summarizer that ignored the guidance — or an
+        iterative update that quoted the PREVIOUS summary, which the prompt asks it to
+        "PRESERVE all existing information" — produced a summary far above the declared
+        ceiling. Measured on the fleet: 90.3% of stored summaries exceeded the 40,000-char
+        (10,000-token) ceiling, the worst at 432,166 chars (108,041 tokens).
+
+        A single summary that large IS the live context: with the trigger at 153,600 tokens
+        (0.75 of a 204,800 window), one 106,004-token summary left the compaction unable to
+        clear its own threshold. Every pass was then scored "ineffective", two strikes
+        tripped the anti-thrash breaker, and the breaker suppressed compaction for
+        ``_ANTI_THRASH_RECOVERY_SECONDS`` while the request kept growing — the overflow
+        that killed card t_5a6c1faf (all 6 sessions with a tripped breaker ended
+        ``ws_orphan_reap``).
+
+        The head/tail split favours the TAIL: the tail of a handoff carries the most recent
+        state ("Active Task", "In Progress"), and the head carries the preamble that frames
+        it. The elision marker says what was dropped so the model knows the summary is
+        partial rather than complete.
+        """
+        if max_chars <= 0 or len(content) <= max_chars:
+            return content
+        marker = "\n\n...[summary truncated by the size guard]...\n\n"
+        keep = max(max_chars - len(marker), 0)
+        head_chars = int(keep * 0.45)
+        tail_chars = keep - head_chars
+        head = content[:head_chars].rstrip()
+        tail = content[-tail_chars:].lstrip() if tail_chars else ""
+        return head + marker + tail
+
+    def _capped_summary(self, content: str) -> str:
+        """Cap the assembled summary at the declared ``max_summary_tokens`` ceiling.
+
+        The ceiling is expressed in TOKENS; the artifact is text, so convert with the
+        runtime's own CHARS_PER_TOKEN ratio before bounding it.
+        """
+        from agent.model_metadata import CHARS_PER_TOKEN
+
+        return self._bound_summary_output(content, self.max_summary_tokens * CHARS_PER_TOKEN)
+
+    def _request_past_provider_window(self) -> bool:
+        """True when the last real prompt already exceeds the provider's context window.
+
+        The anti-thrash breaker exists to stop paying for compactions that cannot shrink
+        anything. It is not a safety mechanism against the provider's hard limit, and it
+        must never become one: while the breaker holds, the request grows unbounded.
+        This predicate is the escape hatch — it only opens once the session is already
+        past the point where the provider will reject the request, so the cheaper failure
+        (a compaction attempt) is preferred over the certain one (an overflow).
+        """
+        window = int(getattr(self, "context_length", 0) or 0)
+        if window <= 0:
+            return False
+        last = int(getattr(self, "last_real_prompt_tokens", 0) or 0)
+        if last <= 0:
+            last = int(getattr(self, "last_prompt_tokens", 0) or 0)
+        return last > window
+
+    def _anti_thrash_bypass_allowed(self) -> bool:
+        """Whether the anti-thrash breaker must yield because the request is already over.
+
+        The breaker is a COST guard: it stops paying for compactions that cannot shrink
+        anything. It must never become the CAUSE of an overflow — while it holds, nothing
+        bounds the request and the transcript is re-sent every turn. Measured on the fleet:
+        all 6 sessions with ``compression_ineffective_count >= 2`` ended ``ws_orphan_reap``,
+        129.8s-267.2s after the breaker armed, every one of them dead before the 300s
+        probation probe could fire.
+        """
+        if not self._request_past_provider_window():
+            return False
+        if not getattr(self, "quiet_mode", False):
+            logger.warning(
+                "Anti-thrash block bypassed: the request is past the provider context "
+                "window (context=%s) — compacting now rather than riding into an "
+                "overflow (ineffective=%d).",
+                f"{getattr(self, 'context_length', 0):,}",
+                getattr(self, "_ineffective_compression_count", 0),
+            )
+        return True
