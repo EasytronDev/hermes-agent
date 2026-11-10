@@ -52,23 +52,17 @@ jobs:
     name: Build and publish (${{ matrix.variant }}/${{ matrix.arch }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # A dispatch may ask for a single architecture. The matrix is static (a
-    # dynamic one is evaluated before the dispatch inputs are available), so
-    # the unrequested leg skips itself here instead of building.
-    if: >-
-      github.event_name == 'push' ||
-      inputs.arch == '' ||
-      contains(inputs.arch, matrix.arch)
     strategy:
       fail-fast: false
       matrix:
         # The upstream builds arm64 on a native ARM runner; the fork has no
         # access to one, so the arm64 leg runs emulated on the x64 runner and
         # takes far longer than the amd64 leg. The dispatch may therefore ask
-        # for a single architecture. The matrix is a plain 2x2 and the jobs
-        # skip themselves when their leg was not requested — a dynamic
+        # for a single architecture. The matrix is a plain 2x2 — a dynamic
         # `fromJSON(inputs.arch)` matrix would be evaluated before the
-        # inputs are available and yields no jobs at all.
+        # dispatch inputs are available and yields no jobs at all — and each
+        # leg skips ITSELF when it was not requested. `matrix` is not
+        # available in a job-level `if:`, so the filter lives on the steps.
         arch: [amd64, arm64]
         variant: [slim]
         include:
@@ -115,6 +109,12 @@ jobs:
 
       - name: Build and push (${{ matrix.variant }}/${{ matrix.arch }})
         id: push
+        # A dispatch may ask for a single architecture; `matrix` is only
+        # available in step-level conditions, so the leg filter lives here.
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
         uses: docker/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v6
         with:
           context: .
@@ -131,6 +131,10 @@ jobs:
             org.opencontainers.image.version=${{ inputs.tag || 'v0.23.1-kanban1' }}
 
       - name: Record pushed digest
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
         run: |
           digest="$(docker buildx imagetools inspect \
             "${{ env.IMAGE_NAME }}:${{ inputs.tag || 'v0.23.1-kanban1' }}-${{ matrix.arch }}" \
@@ -149,6 +153,10 @@ jobs:
       # package exists as soon as the first image lands, and it must not
       # depend on the manifest job (which a single-arch dispatch skips).
       - name: Make the package public so an anonymous pull works
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -177,6 +185,10 @@ jobs:
           cat /tmp/visibility.json
 
       - name: Prove the anonymous pull works
+        if: >-
+          github.event_name == 'push' ||
+          inputs.arch == '' ||
+          contains(inputs.arch, matrix.arch)
         env:
           TAG: ${{ inputs.tag || 'v0.23.1-kanban1' }}
           ARCH: ${{ matrix.arch }}
