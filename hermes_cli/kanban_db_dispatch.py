@@ -76,8 +76,20 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # Cooldown after a rate-limited (quota-wall) requeue before re-spawning. Without
 # it the task would re-spawn on the very next tick and bounce off the same quota
 # wall, burning a worker slot every tick for hours. Overridable via
-# ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
+# ``kanban.rate_limit_cooldown_seconds`` in config.yaml or the
+# ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` env var.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Ceiling for the exponential backoff applied to CONSECUTIVE rate-limited runs
+# of the same card (base x 2^(streak-1), capped here). A provider that states no
+# reset window (MiniMax's "Token Plan usage limit reached" carries no
+# ``reset_at`` / ``resets_in`` / ``retry_after``) leaves the fixed cooldown as
+# the only spacing, and a flat cooldown probes a multi-hour quota wall every
+# 5 minutes for the whole wall. The backoff keeps the first probe prompt and
+# stretches the spacing as the wall proves persistent. 0 disables it (every
+# retry waits the base cooldown). Overridable via
+# ``kanban.rate_limit_backoff_cap_seconds``.
+DEFAULT_RATE_LIMIT_BACKOFF_CAP_SECONDS = 3600  # 1 hour
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -1556,6 +1568,61 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _consecutive_rate_limited_runs(
+    conn: sqlite3.Connection, task_id: str, *, limit: int = 32,
+) -> int:
+    """How many of the task's most recent finished runs were ``rate_limited``.
+
+    Counts back from the newest finished run and stops at the first run with a
+    different outcome (a crash or a completion supersedes the quota streak, so
+    the next rate-limit starts a fresh backoff). ``limit`` bounds the scan so a
+    card with thousands of runs cannot make the guard expensive.
+    """
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT ?",
+        (task_id, limit),
+    ).fetchall()
+    streak = 0
+    for row in rows:
+        if row["outcome"] == "rate_limited":
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _effective_rate_limit_cooldown(
+    conn: sqlite3.Connection, task_id: str, base_cooldown: int,
+) -> int:
+    """The cooldown this card must wait, given how long the quota wall has lasted.
+
+    The base cooldown applies to the first rate-limited run. Each CONSECUTIVE
+    rate-limited run of the same card doubles it (``base * 2**(streak-1)``),
+    capped at ``kanban.rate_limit_backoff_cap_seconds``. A provider that states
+    no reset window leaves the flat cooldown as the only spacing, and a flat
+    cooldown probes a multi-hour wall every base interval for the whole wall;
+    the backoff keeps the first probe prompt and stretches as the wall proves
+    persistent.
+
+    A cap of 0 disables the backoff (every retry waits the base cooldown), and
+    so does a base cooldown of 0 (the whole path is disabled there).
+    """
+    if base_cooldown <= 0:
+        return base_cooldown
+    cap = _kb._resolve_rate_limit_backoff_cap_seconds()
+    if cap <= 0:
+        return base_cooldown
+    streak = _consecutive_rate_limited_runs(conn, task_id)
+    if streak <= 1:
+        return base_cooldown
+    # base * 2**(streak-1), saturating at the cap; the shift is bounded so a
+    # long streak cannot build a huge integer.
+    scaled = base_cooldown << min(streak - 1, 30)
+    return min(scaled, cap)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
     release_detail: Optional[dict] = None,
@@ -1617,8 +1684,14 @@ def check_respawn_guard(
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
             return None
+        # Consecutive rate-limited runs of THIS card stretch the wait: the first
+        # probe waits the base cooldown, each further one doubles it up to the
+        # backoff cap. A provider that states no reset window (no reset_at /
+        # resets_in / retry_after) otherwise leaves a flat cooldown probing a
+        # multi-hour quota wall every base interval for the whole wall.
+        effective = _effective_rate_limit_cooldown(conn, task_id, rl_cooldown)
         ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
+        if ended_at is not None and (now - ended_at) < effective:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever

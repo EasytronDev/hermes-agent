@@ -1917,6 +1917,20 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Cooldown (seconds) before a card whose last run died on a provider
+        # quota wall (429) may be re-spawned. None = use the built-in default
+        # (300 s). 0 = re-spawn on the next tick (the pre-cooldown behaviour:
+        # the card bounces off the same wall every tick). Overrides the
+        # HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS env var when set.
+        "rate_limit_cooldown_seconds": None,
+        # Ceiling (seconds) for the exponential backoff applied to CONSECUTIVE
+        # rate-limited runs of the same card: base x 2**(streak-1), capped here.
+        # None = use the built-in default (3600 s). 0 disables the backoff (every
+        # retry waits the base cooldown). A provider that states no reset window
+        # (no reset_at / resets_in / retry_after) leaves a flat cooldown as the
+        # only spacing, and a flat cooldown probes a multi-hour quota wall every
+        # base interval for the whole wall.
+        "rate_limit_backoff_cap_seconds": None,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

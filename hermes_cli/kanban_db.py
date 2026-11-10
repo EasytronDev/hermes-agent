@@ -320,9 +320,62 @@ def _resolve_crash_grace_seconds() -> int:
     return _env_int("HERMES_KANBAN_CRASH_GRACE_SECONDS", DEFAULT_CRASH_GRACE_SECONDS)
 
 
+def _kanban_config_int(key: str) -> Optional[int]:
+    """``kanban.<key>`` as an int, or None when unset/unparseable.
+
+    Read through the cached, read-only config loader (the dispatcher calls the
+    rate-limit resolvers once per ready row per tick, so this must not re-parse
+    the file). A malformed value is ignored (None) so the caller falls back to
+    its own default rather than crashing the tick.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    section = cfg.get("kanban")
+    if not isinstance(section, dict):
+        return None
+    raw = section.get(key)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_rate_limit_cooldown_seconds() -> int:
-    """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
+    """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default.
+
+    ``kanban.rate_limit_cooldown_seconds`` in ``config.yaml`` wins over the env
+    var when it is set: the env var is the process-level knob (and the only one
+    a container can set), the config key is the operator-facing one. Precedence:
+    config key > env var > built-in default.
+    """
+    configured = _kanban_config_int("rate_limit_cooldown_seconds")
+    if configured is not None and configured >= 0:
+        return configured
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
+def _resolve_rate_limit_backoff_cap_seconds() -> int:
+    """Ceiling for the exponential backoff on consecutive rate-limited runs.
+
+    ``kanban.rate_limit_backoff_cap_seconds`` in config.yaml wins over the
+    ``HERMES_KANBAN_RATE_LIMIT_BACKOFF_CAP_SECONDS`` env var. 0 disables the
+    backoff (every retry waits the base cooldown).
+    """
+    configured = _kanban_config_int("rate_limit_backoff_cap_seconds")
+    if configured is not None and configured >= 0:
+        return configured
+    return _env_int(
+        "HERMES_KANBAN_RATE_LIMIT_BACKOFF_CAP_SECONDS",
+        DEFAULT_RATE_LIMIT_BACKOFF_CAP_SECONDS,
+    )
 
 
 # --- Paths ---
@@ -4216,6 +4269,7 @@ from hermes_cli.kanban_db_workspace import (
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
+    DEFAULT_RATE_LIMIT_BACKOFF_CAP_SECONDS,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
