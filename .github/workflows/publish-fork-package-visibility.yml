@@ -25,6 +25,11 @@ on:
 
 permissions:
   contents: read
+  # NOTE: the workflow `permissions` block only accepts read/write/none for
+  # packages. The visibility endpoint needs the `admin:packages` scope on the
+  # TOKEN, which the workflow GITHUB_TOKEN does not carry (it has packages:
+  # write) -> a PAT with admin:packages (PACKAGES_ADMIN_TOKEN) is the only
+  # path. Keeping `packages: write` so the anonymous-pull proof still works.
   packages: write
 
 jobs:
@@ -57,7 +62,7 @@ jobs:
       # back to a PAT stored as a repository secret.
       - name: Set the package visibility to public
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PAT: ${{ secrets.PACKAGES_ADMIN_TOKEN }}
           OWNER_PATH: ${{ steps.owner.outputs.path }}
           PACKAGE: ${{ inputs.package || 'hermes-agent' }}
