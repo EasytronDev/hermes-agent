@@ -20,6 +20,7 @@ automatically -- and they would not. `apply_auto_vacuum` therefore reports the
 VERIFIED state and says what makes the change stick.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -288,7 +289,7 @@ class TestWorkerExecutionsStatusIndex:
     """The index the status-only probes were missing."""
 
     def test_status_probe_is_a_search_not_a_scan(self, tmp_path):
-        """`WHERE status='terminal'` used to SCAN worker_executions.
+        """`WHERE status != 'terminal'` used to SCAN worker_executions.
 
         The table grows by one row per worker run, so the scan grows with it.
         The index is built from the REAL schema DDL, so this fails if the index
@@ -306,7 +307,77 @@ class TestWorkerExecutionsStatusIndex:
 
         plan = " ".join(
             row[3] for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT * FROM worker_executions WHERE status='terminal'"))
-        assert "USING INDEX idx_worker_executions_status" in plan, plan
-        assert "SCAN worker_executions" not in plan, plan
+                "EXPLAIN QUERY PLAN SELECT 1 FROM worker_executions WHERE status != 'terminal'"))
+        # SQLite reports a full pass over a partial index as
+        # "SCAN worker_executions USING COVERING INDEX <name>" -- the index is
+        # used, and the query is answered from the index alone (no table row
+        # lookup). What must NOT happen is a bare "SCAN worker_executions".
+        assert "idx_worker_executions_status" in plan, plan
+        assert "SCAN worker_executions" not in plan.replace(
+            "SCAN worker_executions USING COVERING INDEX idx_worker_executions_status", ""), plan
+        conn.close()
+
+    def test_partial_index_excludes_terminal_rows(self, tmp_path):
+        """The index holds only the non-terminal executions.
+
+        A full (status) index also carries every terminal row, and the planner
+        then prefers it for the lineage probe -- whose WHERE clause lists
+        exactly the non-terminal statuses -- even though that index is not
+        covering. Measured on 300k executions, the lineage probe went from
+        1,36 ms to 75,12 ms and its plan changed from the covering
+        (session_id, status) index to a non-covering (status) one.
+        """
+        from hermes_state_common import SCHEMA_SQL
+
+        conn = _conn(tmp_path)
+        conn.executescript(SCHEMA_SQL)
+        conn.executemany(
+            "INSERT INTO worker_executions (execution_id, session_id, kind, owner_epoch, "
+            "generation, status, adoption_digest) VALUES (?, ?, 'kanban', 1, 1, ?, 'd')",
+            [(f"exec-{i}", f"sess-{i}", "terminal" if i % 3 else "running")
+             for i in range(60)])
+        non_terminal = conn.execute(
+            "SELECT COUNT(*) FROM worker_executions WHERE status != 'terminal'").fetchone()[0]
+        assert non_terminal == 20, non_terminal
+
+        # The partial predicate is part of the index definition, so a terminal
+        # row is simply not in it.
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_worker_executions_status'").fetchone()[0]
+        assert "terminal" in sql, sql
+
+        indexed = conn.execute(
+            "SELECT COUNT(*) FROM worker_executions INDEXED BY idx_worker_executions_status "
+            "WHERE status != 'terminal'").fetchone()[0]
+        assert indexed == non_terminal, indexed
+        conn.close()
+
+    def test_lineage_probe_keeps_the_covering_index(self, tmp_path):
+        """The two probes coexist: the status index must not displace the covering one.
+
+        The lineage probe filters on session_id AND a list of non-terminal
+        statuses. Only the (session_id, status) index can answer it as a
+        covering search; the partial status index carries status but not
+        session_id, so if the planner prefers it the probe pays a table lookup
+        per matching row. This pins the interaction the two probes have.
+        """
+        from hermes_state_common import SCHEMA_SQL
+
+        conn = _conn(tmp_path)
+        conn.executescript(SCHEMA_SQL)
+        conn.executemany(
+            "INSERT INTO worker_executions (execution_id, session_id, kind, owner_epoch, "
+            "generation, status, adoption_digest) VALUES (?, ?, 'kanban', 1, 1, ?, 'd')",
+            [(f"exec-{i}", f"sess-{i}", "terminal" if i % 3 else "running")
+             for i in range(60)])
+
+        plan = " ".join(
+            row[3] for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT DISTINCT status FROM worker_executions "
+                "WHERE session_id IN (SELECT value FROM json_each(?)) "
+                "AND status IN ('registered','running','unknown')",
+                (json.dumps(["sess-0", "sess-1"]),)))
+        assert "idx_worker_executions_session_status" in plan, plan
+        assert "COVERING" in plan, plan
+        assert "idx_worker_executions_status" not in plan, plan
         conn.close()
