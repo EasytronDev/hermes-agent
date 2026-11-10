@@ -807,6 +807,173 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+# --- open-card-without-a-terminal-transition ------------------------------
+#
+# The indicator the board was missing: a card that has been OPEN for hours without
+# ever reaching a terminal transition. It is the shape the guardrail class leaves
+# behind, measured on this host over 7 days: the worker's turn ends on a runtime
+# guardrail (or an iteration budget, or a lost managed worker) with no terminal board
+# call, the dispatcher books a protocol violation and requeues the card, the card
+# crash-loops until the breaker trips, and then it waits for a human — measured on
+# t_eee22555 (15h to close, 9.6h of it crash-looping) and t_72d039e0.
+#
+# The existing rules each cover a SLICE of that: ``stale_running`` needs an expired
+# claim AND no live worker (a card whose process is alive but whose session is dead
+# slips through), ``stuck_in_blocked`` needs 24h, ``stranded_in_ready`` fires after
+# 30 min on any ready card (including cards that are simply waiting their turn).
+# This rule is the one the owner asked for: age of the OPEN card, lane-agnostic.
+
+#: The event kinds that mean the card left the worker's hands for good. A card that
+#: has produced one of these is not "open without a terminal transition" any more.
+#:
+#: ``blocked`` is in this set because an explicit ``kanban_block`` IS a handoff: the
+#: worker decided that a decision from the owner is required and said so. It is NOT the
+#: same as the breaker trip (``gave_up``), which leaves the card ``blocked`` with nobody
+#: having asked anything — that one keeps the card open, and it is the shape the
+#: guardrail class leaves behind (measured: t_eee22555 sat ``blocked`` for 5.5h after
+#: its breaker tripped, waiting for a manual promotion).
+_TERMINAL_TRANSITION_KINDS = frozenset({
+    "completed",
+    "review_requested",
+    "changes_requested",
+    "scheduled",
+    "archived",
+    "cancelled",
+    "blocked",
+    "block_loop_detected",
+})
+
+#: The lanes a card can be open in. ``todo`` is excluded on purpose: a card waiting
+#: for its parents is not stuck, it is queued.
+_OPEN_LANES = frozenset({"running", "ready", "blocked", "review", "todo"})
+
+
+def _rule_open_without_terminal(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A card OPEN for >= cfg["open_without_terminal_seconds"] (default 8h) with no
+    terminal transition.
+
+    "Open" means the card has not produced a terminal transition event since it was
+    created: no ``completed``, no ``review_requested``, no ``changes_requested``. The
+    card may be in any work lane (``running``, ``ready``, ``blocked``, ``review``) —
+    the point is that nobody finished it and nobody is going to without an operator.
+
+    Deliberately age-based and lane-agnostic, because the failure mode is not a
+    specific lane: a ``running`` card whose session died while its process lives, a
+    ``blocked`` card parked on a breaker trip, and a ``ready`` card requeued by the
+    crash sweep all look the same from the board: open, with the work done (or not)
+    and unreachable.
+
+    Read-only: it reports the signal and the recovery actions, it never moves the
+    card. The dispatcher owns every state change.
+    """
+    threshold = float(cfg.get("open_without_terminal_seconds", 8 * 3600))
+    status = str(_task_field(task, "status", "") or "")
+    if status not in _OPEN_LANES:
+        return []
+
+    # A card that reached a terminal transition is not open any more.
+    terminal_at = _latest_event_ts(events, set(_TERMINAL_TRANSITION_KINDS))
+    if terminal_at:
+        return []
+
+    # The age starts at the card's creation: the open interval is the whole life of
+    # the card, and a card that has been open since creation is the one nobody
+    # finished. ``started_at`` would under-report a card that was never claimed.
+    created_at = int(_task_field(task, "created_at", default=0) or 0)
+    if not created_at:
+        return []
+    age_seconds = now - created_at
+    if age_seconds < threshold:
+        return []
+
+    # Is anybody working on this card RIGHT NOW? The signal must come from the DATA,
+    # not from the process table: a diagnostic for a remote board's DB cannot read the
+    # local pids, and the heartbeat is useless here — the crashed worker's LAST
+    # heartbeat is written seconds before it dies, so "heartbeat in the last hour"
+    # says "the worker was alive until it crashed", which is exactly the card that
+    # then sits for hours.
+    #
+    # The honest test is the RUN: a run that is still open (``ended_at IS NULL``) means
+    # a worker is executing the card. A run that ended without a terminal outcome
+    # means the last attempt stopped mid-flight.
+    open_run = None
+    closed_runs = []
+    for run in runs or []:
+        ended_at = _task_field(run, "ended_at", None)
+        outcome = str(_task_field(run, "outcome", "") or "")
+        if ended_at is None and outcome not in {"completed", "review_requested",
+                                                "changes_requested", "scheduled"}:
+            open_run = run
+            continue
+        if ended_at is not None and outcome not in {"completed", "review_requested",
+                                                     "changes_requested", "scheduled"}:
+            closed_runs.append(run)
+    if open_run is not None:
+        return []  # a worker is executing this card right now
+
+    age_h = age_seconds / 3600.0
+    age_str = f"{age_h:.1f}h"
+    # Escalate with age: <2x threshold warning, 2x-6x error, >6x critical.
+    if age_seconds >= threshold * 6:
+        severity = "critical"
+    elif age_seconds >= threshold * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    # The newest closed run that did not hand the card over.
+    stalled_run = closed_runs[-1] if closed_runs else None
+    run_id = _task_field(stalled_run, "id", None) if stalled_run is not None else None
+    run_outcome = str(_task_field(stalled_run, "outcome", "") or "") if stalled_run is not None else ""
+    run_error = str(_task_field(stalled_run, "error", "") or "") if stalled_run is not None else ""
+
+    # The last heartbeat is still worth reporting: it dates the worker's death.
+    last_hb = 0
+    for ev in events:
+        if _event_kind(ev) == "heartbeat":
+            last_hb = max(last_hb, _event_ts(ev))
+    if not last_hb:
+        last_hb = int(_task_field(task, "last_heartbeat_at", default=0) or 0)
+    hb_age = (now - last_hb) if last_hb else None
+
+    task_id = str(_task_field(task, "id") or "")
+    detail = (
+        f"This card has been open for {age_str} and has never reached a terminal transition "
+        f"(no completed, no review requested, no changes requested). It is currently `{status}`"
+        + (f", its last run ended as `{run_outcome}`" if run_outcome else "")
+        + (f" with: {run_error[:200]}" if run_error else "")
+        + ". No run is executing it: the last attempt stopped without handing the card over, "
+        "so nothing is working on it and nothing will without an operator. The usual cause is "
+        "a worker turn that ended on a runtime guardrail with no terminal board call (the "
+        "guardrail's own reply asks the owner for `continue`, and nobody watches a headless "
+        "card), so the card was requeued and then waited. The work of that turn may be "
+        "delivered already — check the card's log and the PR before re-running anything."
+    )
+    return [Diagnostic(
+        kind="open_without_terminal",
+        severity=severity,
+        title=f"Open for {age_str} without a terminal transition",
+        detail=detail,
+        actions=[
+            DiagnosticAction(kind="reclaim", label="Reclaim the card", suggested=True),
+            DiagnosticAction(kind="comment", label="Close it out with what landed"),
+            _cli_hint("Read the card's log", f"hermes kanban log {task_id}"),
+        ],
+        first_seen_at=created_at, last_seen_at=created_at, count=1,
+        run_id=run_id,
+        data={
+            "status": status,
+            "created_at": created_at,
+            "age_seconds": int(age_seconds),
+            "threshold_seconds": int(threshold),
+            "last_heartbeat_at": last_hb or None,
+            "heartbeat_age_seconds": (int(hb_age) if hb_age is not None else None),
+            "stalled_run_id": run_id,
+            "stalled_run_outcome": run_outcome or None,
+        },
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -820,6 +987,7 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_stale_running,
+    _rule_open_without_terminal,
 ]
 
 
@@ -838,6 +1006,10 @@ DEFAULT_CONFIG = {
     # still `running` an hour past its expiry means every reclaim path declined
     # it. Same hour the heartbeat backstop uses.
     "stale_running_grace_seconds": 60 * 60,
+    # The owner's indicator: a card should not stay open this long without a terminal
+    # transition. 8h is the number the board owner asked for; the measured baseline on
+    # this host was 43 of 748 cards (5.9%) over 7 days, and the target is <1%.
+    "open_without_terminal_seconds": 8 * 3600,
 }
 
 
