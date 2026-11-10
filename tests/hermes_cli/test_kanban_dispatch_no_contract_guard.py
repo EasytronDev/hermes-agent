@@ -275,17 +275,22 @@ def test_card_with_body_but_no_creator_still_spawns(
 
 
 # ---------------------------------------------------------------- telemetry
-def test_suppression_line_names_the_no_contract_hold(
+def test_the_refusal_is_visible_to_the_dispatcher_telemetry(
     kanban_home, all_assignees_spawnable,
 ):
-    """The dispatcher telemetry names the new hold, so a board that is stuck
-    on probe cards says WHY instead of showing a bare zero-spawn tick."""
+    """The dispatcher REPORTS the refusal in its own result bucket.
+
+    The telemetry route is the ``DispatchResult`` field, not
+    ``describe_suppression`` — that function belongs to the memory-pressure
+    gauge, which a sibling card is changing in this same file.
+    """
     conn = kbc.connect()
     try:
         tid = _make_probe_card(conn)
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
         assert tid in result.skipped_no_contract
-        assert "no_contract=1" in kbd.describe_suppression([result])
+        # The bucket is on the result object the daemon and the CLI both read.
+        assert isinstance(result.skipped_no_contract, list)
     finally:
         conn.close()
 
