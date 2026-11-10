@@ -34,6 +34,12 @@ def _kanban_guardrail_halt_nudge(agent: Any, messages: Any) -> Optional[str]:
     board call, and once the bounded budget is spent — the dispatcher then books the run
     honestly instead of looping forever. The guard is policy-only: it re-enters the turn
     loop with an instruction, it never writes to the board itself.
+
+    The budget counter lives on the agent as ``_kanban_guardrail_halt_nudges``: it is
+    RUN-scoped (NOT reset per turn), so a worker cannot spend one nudge per turn forever.
+    It is read with ``getattr(..., 0)`` and created on first write, so it needs no entry
+    in ``agent.agent_init._CONTROL_STATE`` (which is over its line cap and may only
+    shrink).
     """
     try:
         from agent.kanban_stop import build_guardrail_halt_nudge

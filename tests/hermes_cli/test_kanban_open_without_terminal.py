@@ -124,8 +124,8 @@ def test_the_severity_escalates_with_age():
         _task(created_at=now - 9 * HOUR), [], [], now=now)
     old = kd.compute_task_diagnostics(
         _task(created_at=now - 50 * HOUR), [], [], now=now)
-    young_diag = [d for d in young if d.kind == "open_without_terminal"][0]
-    old_diag = [d for d in old if d.kind == "open_without_terminal"][0]
+    young_diag = next(d for d in young if d.kind == "open_without_terminal")
+    old_diag = next(d for d in old if d.kind == "open_without_terminal")
     # 9h is just past the 8h threshold → warning; 50h is past 6x it → critical.
     assert young_diag.severity == "warning"
     assert old_diag.severity == "critical"
@@ -141,7 +141,7 @@ def test_the_diagnostic_carries_the_evidence():
                 "kanban_complete, kanban_block or kanban_request_review")],
         now=now,
     )
-    diag = [d for d in diags if d.kind == "open_without_terminal"][0]
+    diag = next(d for d in diags if d.kind == "open_without_terminal")
     assert diag.data["status"] == "blocked"
     assert diag.data["age_seconds"] >= 10 * HOUR
     assert diag.data["stalled_run_outcome"] == "crashed"
