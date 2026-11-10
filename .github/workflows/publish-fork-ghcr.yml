@@ -38,7 +38,9 @@ concurrency:
 
 env:
   # The fork's own namespace on GHCR. NOT nousresearch/* — that is upstream's.
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/hermes-agent
+  # Docker repository names must be lowercase; the GitHub owner is
+  # `EasytronDev`, so the name is spelled out lowercased here.
+  IMAGE_NAME: ghcr.io/easytrondev/hermes-agent
   CANDIDATE_COMMIT: ${{ github.sha }}
 
 jobs:
