@@ -129,6 +129,13 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_no_contract: list[str] = field(default_factory=list)
+    """Ready/review task ids that carry NO execution contract — ``body`` empty
+    AND ``created_by`` empty — so no worker was spawned for them. A card with
+    no body gives the worker nothing to do: spawning it burns a worker slot
+    for a card that cannot produce a useful result (the probe-card incident).
+    The card is left in ``ready`` (never claimed), so its claim lock never
+    dangles and the reclaim machinery is untouched."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -175,6 +182,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.skipped_no_contract:
+            counts["no_contract"] = counts.get("no_contract", 0) + len(res.skipped_no_contract)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -2122,6 +2131,36 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Barrier: a card with NO execution contract (body empty AND created_by
+    # empty) must never become a worker. It carries no spec, so the worker can
+    # do nothing useful — it burns a worker slot and returns an empty result,
+    # and the kernel blocks the card only AFTER the slot was spent.
+    #
+    # The check sits BEFORE the claim on purpose: the card is left in ``ready``
+    # with no claim lock, so there is no lock to dangle and the reclaim
+    # machinery is untouched. A card WITH a contract whose worker dies is still
+    # reclaimed by ``release_stale_claims`` exactly as before — this barrier
+    # never disables the reclaim, it only refuses to DISPATCH a card that
+    # could not be executed.
+    #
+    # Covers cards created outside ``create_task`` (raw SQL), which is why the
+    # guard lives in the dispatcher and not only at creation time.
+    if _is_no_contract(row):
+        result.skipped_no_contract.append(task_id)
+        # One event per card (not one per tick): the condition never changes on
+        # its own, so a repeat would only spam the board. Re-write it only when
+        # something else happened on the card since (an edit that filled the
+        # body, a comment).
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                payload = _no_contract_event_payload(row)
+                if (last is None or last["kind"] != "skipped_no_contract"
+                        or last["payload"] != _kb._json_or_null(payload)):
+                    _kb._append_event(conn, task_id, "skipped_no_contract", payload)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2356,10 +2395,46 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body, created_by FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _is_no_contract(row: sqlite3.Row) -> bool:
+    """True when a card carries NO execution contract.
+
+    A card's contract is its ``body`` (what the worker is asked to do) together
+    with ``created_by`` (who asked for it). When BOTH are empty there is
+    nothing for a worker to execute: it gets no spec and no provenance, so the
+    only thing a spawned worker can do is burn its slot and return an empty
+    result — the kernel then blocks the card *after* the worker has already
+    consumed the slot.
+
+    The discriminator is deliberately the CONJUNCTION of both empties, not
+    either one alone:
+
+    * the 74 legacy no-body cards on the ``default`` board all carry a
+      ``created_by`` — they are legitimate cards whose body was never filled
+      in, and the dispatcher must keep spawning them;
+    * cards with a body but no ``created_by`` exist too (``body`` is the
+      contract; ``created_by`` only adds provenance).
+
+    So only a card that is empty on BOTH axes is refused. Measured on this
+    host: 5 such cards, all of them probe cards, and zero legitimate cards.
+    """
+    body = row["body"]
+    created_by = row["created_by"]
+    return not (body or "").strip() and not (created_by or "").strip()
+
+
+def _no_contract_event_payload(row: sqlite3.Row) -> dict:
+    """Payload for the ``skipped_no_contract`` event — names what was empty."""
+    return {
+        "reason": "no_execution_contract",
+        "body_empty": not (row["body"] or "").strip(),
+        "created_by_empty": not (row["created_by"] or "").strip(),
+    }
 
 
 def _any_spawnable_review(
@@ -2384,6 +2459,11 @@ def _any_spawnable_review(
     for row in review_rows:
         assignee = row["assignee"]
         if not assignee:
+            continue
+        # A card with no execution contract is never dispatched, so it must not
+        # reserve a review slot either (it would withhold capacity from a
+        # review that can actually run).
+        if _is_no_contract(row):
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue
