@@ -129,6 +129,10 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_no_contract: list[str] = field(default_factory=list)
+    """Ready/review task ids with NO execution contract (``body`` AND
+    ``created_by`` both empty) — no worker was spawned for them. See
+    ``hermes_cli.kanban_db_dispatch_contract``."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2122,11 +2126,17 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Two refusals, ONE decision (the function is at the repo's complexity
+    # cap): a card with NO execution contract must never become a worker, and
+    # neither may a card whose assignee names no profile. ``_kbcn`` records the
+    # refusal in its own bucket and returns True.
+    profile_exists = _profile_exists_fn()
+    if _kbcn.refuse_no_contract_card(conn, row, result, dry_run=dry_run):
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
-    profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
@@ -2134,14 +2144,8 @@ def _dispatch_lane_task(
         # condition never expires on its own, so write it once: a repeat only when something
         # else happened on the card since (reassign, comment) — not one row per tick forever,
         # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+        _kbcn.record_skip_event_once(
+            conn, task_id, "skipped_nonspawnable", {"assignee": assignee}, dry_run=dry_run)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2356,7 +2360,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body, created_by FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2384,6 +2388,10 @@ def _any_spawnable_review(
     for row in review_rows:
         assignee = row["assignee"]
         if not assignee:
+            continue
+        # A card with no execution contract is never dispatched, so it must not
+        # reserve a review slot either.
+        if _kbcn.is_no_contract(row):
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue
@@ -2727,90 +2735,6 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-_retagged_workspace_roots: set[str] = set()
-
-def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
-    """Reclaim pre-tag worker rows in state.db so they leave the session lists.
-
-    Best-effort: the durable gate is ``state_meta`` in
-    ``retag_kanban_worker_sessions``; the in-process set avoids reopening
-    state.db on every spawn. A tick must never fail because a session DB was
-    busy or missing.
-    """
-    if workspaces_root_path in _retagged_workspace_roots:
-        return
-    try:
-        from hermes_state_registry import acquire, release_or_close
-
-        # Inside the gateway the dispatcher shares the process's registry handle; a bare
-        # SessionDB() here was one more writer connection on the same state.db (#100896).
-        db = acquire()
-        try:
-            db.retag_kanban_worker_sessions(workspaces_root_path)
-        finally:
-            release_or_close(db)
-        _retagged_workspace_roots.add(workspaces_root_path)
-    except Exception as exc:
-        _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
-
-
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
-    import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
-
-
-def _open_worker_log(task: Task, board: Optional[str]):
-    """Append-mode per-task log (a re-run on unblock appends, never overwrites),
-    rotated first. Anchored at the board root (not the shared kanban root) so
-    `hermes kanban log` reads its own file and boards sharing task ids don't
-    collide."""
-    log_dir = _kb.worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task.id}.log"
-    from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
-    rotate_worker_log(log_path, *worker_log_rotation_config())
-    return open(log_path, "ab")
-
-
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
-
-    Kanban workers are long-lived agentic runs that outlive the dispatcher
-    tick, so they never take cron's degraded mode under the managed gateway:
-    ``require_restart_safe_scope=True`` makes the helper raise
-    ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the
-    dispatcher does not charge to the card). Under any other systemd unit
-    (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
-    worker its own scope so the unit's cgroup teardown cannot kill it.
-    """
-    from tools.process_registry import restart_safe_gateway_child_argv
-
-    if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable worker.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
-        dispatch = restart_safe_gateway_child_argv(
-            command,
-            unit_suffix=f"kanban-{task.id}-run-missing",
-            require_restart_safe_scope=True,
-            outlives_parent=True,
-        )
-        if dispatch.mode != "in_process":
-            raise RuntimeError(
-                "cannot create restart-safe systemd scope for Kanban worker: "
-                "the claimed task has no current run id"
-            )
-        return command
-
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-        require_restart_safe_scope=True,
-        outlives_parent=True,
-    ).argv
-
-
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -3021,4 +2945,16 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_dispatch_contract as _kbcn
+from hermes_cli import kanban_db_dispatch_spawn as _kbsp
 from hermes_cli import kanban_db_workspace as _kbw
+
+# The worker-launch helpers live in ``kanban_db_dispatch_spawn`` (the dispatch
+# file is past the repo's size cap). They are bound HERE because that is where
+# they have always been reached from — a test that patches ``kbd._worker_argv``
+# patches this binding, and ``_default_spawn`` below calls through this
+# module, so the patch still takes effect.
+_retag_legacy_worker_sessions = _kbsp._retag_legacy_worker_sessions
+_worker_argv = _kbsp._worker_argv
+_open_worker_log = _kbsp._open_worker_log
+_restart_safe_worker_argv = _kbsp._restart_safe_worker_argv
