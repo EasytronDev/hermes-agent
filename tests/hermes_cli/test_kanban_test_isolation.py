@@ -323,6 +323,57 @@ def test_no_pin_at_all_still_resolves_into_the_sandbox(monkeypatch, live_board_d
         )
 
 
+def test_board_context_survives_a_sys_modules_purge(monkeypatch, tmp_path):
+    """The board context must survive a test that purges ``hermes_cli``.
+
+    The repo's own ``test_kanban_per_profile_cap.py`` purges
+    ``hermes_cli`` from ``sys.modules`` and re-imports it. If the board
+    resolver kept its context (the scoped ``--board`` override, the
+    machine-flow flag) in ContextVars of a PURGED module, the resolver would
+    read a DIFFERENT object than the caller set — and the scoped override
+    would silently become invisible, i.e. the pinned board would win over
+    the caller's explicit ``--board``.
+
+    Measured: ``test_cli_board_flag_trumps_worker_env_pin_end_to_end`` and
+    ``test_notifier_seam_connect_lands_on_pinned_db`` failed only when the
+    purging test ran FIRST — an order-dependent failure.
+    """
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::test_y (call)")
+    pin = tmp_path / "pinned" / "kanban.db"
+    pin.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+    def _purge_hermes_cli() -> None:
+        for name in list(sys.modules):
+            if name.startswith("hermes_cli"):
+                del sys.modules[name]
+
+    # The caller sets the scoped board on the module it holds.
+    kb._CURRENT_BOARD_OVERRIDE.set("sycode-trading")
+    try:
+        _purge_hermes_cli()
+        import hermes_cli.kanban_db as kb_after
+
+        assert kb_after._CURRENT_BOARD_OVERRIDE.get() == "sycode-trading", (
+            "the scoped board context did not survive the sys.modules purge — "
+            "the board resolver would read a different ContextVar than the "
+            "caller set, and the pinned board would win over --board"
+        )
+        # The resolver must see it too, not just the module attribute.
+        with kb_after.scoped_current_board("sycode-trading"):
+            assert kb_after._CURRENT_BOARD_OVERRIDE.get() == "sycode-trading"
+    finally:
+        kb._CURRENT_BOARD_OVERRIDE.set(None)
+
+    _purge_hermes_cli()
+    import hermes_cli.kanban_db as kb_restored
+
+    assert kb_restored._CURRENT_BOARD_OVERRIDE.get() is None, (
+        "the scoped board context leaked past the purge — a later test would "
+        "inherit a board it never asked for"
+    )
+
+
 # ── The test with teeth ─────────────────────────────────────────────────────
 
 

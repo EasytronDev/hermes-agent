@@ -723,6 +723,15 @@ def _capture_pinned_kanban_roots() -> list[Path]:
 
 _REAL_KANBAN_ROOTS = [_REAL_KANBAN_ROOT, *_capture_pinned_kanban_roots()]
 
+# The DEPLOYMENT's own HERMES_HOME, captured BEFORE the hermetic sandbox
+# rewired it. The kernel needs it to tell a test's home (a disposable temp
+# dir a test owns) from the deployment's home (a LIVE tree that must never
+# be claimed as a sandbox) — without it the guard treated the deployment's
+# home as disposable and every no-pin resolver escaped into it (measured:
+# all five resolvers landed under the deployment tree again).
+_REAL_HERMES_HOME = Path(os.environ.get("HERMES_HOME", "")).expanduser().resolve() \
+    if os.environ.get("HERMES_HOME", "").strip() else None
+
 
 def _publish_deployment_kanban_roots() -> None:
     """Tell the KERNEL where this deployment keeps its boards.
@@ -743,6 +752,8 @@ def _publish_deployment_kanban_roots() -> None:
         if text not in roots:
             roots.append(text)
     os.environ["HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS"] = os.pathsep.join(roots)
+    if _REAL_HERMES_HOME is not None:
+        os.environ["HERMES_TEST_DEPLOYMENT_HOME"] = str(_REAL_HERMES_HOME)
 
 
 _publish_deployment_kanban_roots()

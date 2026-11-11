@@ -32,6 +32,7 @@ from typing import Any, Iterable, Optional
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
+from agent import delegation_context as _dc
 
 _log = logging.getLogger(__name__)
 
@@ -328,14 +329,16 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
-_CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
-    "hermes_kanban_current_board_override", default=None,
-)
+# Which board a call is scoped to, and whether a machine flow is enumerating
+# boards. The ContextVars live in ``agent.delegation_context`` — a module a
+# test's ``sys.modules`` purge does NOT touch — so the board resolver and
+# the caller always see the SAME object (measured: a purge left the
+# resolver reading a different ContextVar than the caller set, and the
+# scoped ``--board`` override became invisible).
+_CURRENT_BOARD_OVERRIDE = _dc._KANBAN_CURRENT_BOARD_OVERRIDE
 # Machine flows that enumerate boards (gateway notifier / watcher / dispatcher
 # ticks) resolve board paths env-pin-first — see pin_first_board_resolution().
-_PIN_FIRST_BOARD_RESOLUTION: ContextVar[bool] = ContextVar(
-    "hermes_kanban_pin_first_board_resolution", default=False,
-)
+_PIN_FIRST_BOARD_RESOLUTION = _dc._KANBAN_PIN_FIRST_BOARD_RESOLUTION
 
 
 @contextlib.contextmanager
@@ -503,10 +506,11 @@ def board_exists(board: Optional[str] = None) -> bool:
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
     """Explicit caller intent: a direct ``board=`` argument, else the scoped
     ``--board`` context (CLI ``hermes kanban --board``, dashboard plugin_api);
-    ``None`` when the caller expressed neither. Lives in
+    ``None`` when the caller expressed neither. The rules live in
     :mod:`hermes_cli.kanban_db_paths`."""
     from hermes_cli import kanban_db_paths
-    return kanban_db_paths._explicit_board_slug(board)
+    return kanban_db_paths.explicit_board_slug(
+        board, _CURRENT_BOARD_OVERRIDE.get(), _normalize_board_slug)
 
 
 def _explicit_board_intent_pinned() -> bool:
@@ -520,9 +524,9 @@ def _explicit_board_intent_pinned() -> bool:
     physically cannot see other boards" isolation (5ec6baa), and
     ``agent.delegation_context.kanban_path_is_fenced`` checks the pinned path /
     fenced root — an explicit board that resolved elsewhere would also escape
-    that fence. Lives in :mod:`hermes_cli.kanban_db_paths`."""
+    that fence. The rules live in :mod:`hermes_cli.kanban_db_paths`."""
     from hermes_cli import kanban_db_paths
-    return kanban_db_paths._explicit_board_intent_pinned()
+    return kanban_db_paths.explicit_board_intent_is_pinned(_PIN_FIRST_BOARD_RESOLUTION.get())
 
 
 def _board_path(
@@ -530,9 +534,20 @@ def _board_path(
 ) -> Path:
     """Shared resolver for a board's path. The rules live in
     :mod:`hermes_cli.kanban_db_paths` (a topical sibling: this facade had
-    grown past the repository's per-file line cap)."""
+    grown past the repository's per-file line cap).
+
+    Every piece of caller state is passed IN rather than read by the
+    sibling: the scoped-board and machine-flow flags are ContextVars of THIS
+    module, and a sibling reading them through a late import would see a
+    different object after a test purges ``hermes_cli`` from ``sys.modules``.
+    """
     from hermes_cli import kanban_db_paths
-    return kanban_db_paths.board_path(env_var, board, default_parts, leaf)
+    return kanban_db_paths.board_path(
+        env_var, board, default_parts, leaf,
+        _CURRENT_BOARD_OVERRIDE.get(), _PIN_FIRST_BOARD_RESOLUTION.get(),
+        get_current_board, DEFAULT_BOARD, kanban_home(), board_dir,
+        _normalize_board_slug,
+    )
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:

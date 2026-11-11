@@ -81,6 +81,13 @@ _PYTEST_BASETEMP_ENV = "HERMES_TEST_PYTEST_BASETEMP"
 #: makes "is this pin a live board?" answerable inside a test run, where
 #: every env-derived root is the sandbox itself.
 _DEPLOYMENT_ROOTS_ENV = "HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS"
+# The DEPLOYMENT's own HERMES_HOME, published by the hermetic conftest
+# before it rewired HERMES_HOME to the per-test sandbox. A test's home is a
+# disposable temp dir; the deployment's home is a LIVE tree. Without this
+# distinction the guard would claim the deployment's own home as a sandbox
+# and every no-pin resolver would escape into it (measured: all five
+# resolvers landed under the deployment tree).
+_DEPLOYMENT_HOME_ENV = "HERMES_TEST_DEPLOYMENT_HOME"
 
 
 def running_under_pytest() -> bool:
@@ -149,6 +156,19 @@ def _candidate_sandbox_roots() -> list[Path]:
     if isolation and isolation != "1":
         add(isolation)
 
+    # The test's OWN ``HERMES_HOME``: a test that points it at a fresh temp
+    # dir owns that tree, and its board must resolve THERE. Without this the
+    # no-pin path would be redirected into the shared per-process sandbox —
+    # and one test's board would leak into the next test's (measured: the
+    # repo's ``test_kanban_per_profile_cap.py`` saw the previous test's
+    # tasks and dispatched 2 instead of 1).
+    #
+    # It counts as a sandbox only when it is NOT the deployment's own home:
+    # a production ``HERMES_HOME`` must never be claimed as disposable.
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if home and not _is_deployment_home(home):
+        add(home)
+
     resolved: list[Path] = []
     for root in roots:
         try:
@@ -156,6 +176,48 @@ def _candidate_sandbox_roots() -> list[Path]:
         except (OSError, ValueError):
             continue
     return resolved
+
+
+def _is_deployment_home(home: str) -> bool:
+    """True when *home* is this deployment's own Hermes home, not a test's.
+
+    The deployment's home is the one the hermetic conftest captured BEFORE
+    it rewired ``HERMES_HOME`` to the per-test sandbox (published as
+    ``HERMES_TEST_DEPLOYMENT_HOME``), or the platform-native root
+    (``~/.hermes``), or anything under a published deployment board root.
+    A test's home is anything else — a disposable temp dir the test owns.
+    """
+    try:
+        resolved = Path(home).expanduser().resolve()
+    except (OSError, ValueError):
+        return True
+    for root in _deployment_board_roots():
+        if resolved == root or _is_relative_to(resolved, root):
+            return True
+    published = os.environ.get(_DEPLOYMENT_HOME_ENV, "").strip()
+    if published:
+        try:
+            published_root = Path(published).expanduser().resolve()
+        except (OSError, ValueError):
+            published_root = None
+        if published_root and (resolved == published_root
+                               or _is_relative_to(resolved, published_root)):
+            return True
+    try:
+        from hermes_state_guard import _real_platform_state_root
+
+        native = _real_platform_state_root()
+    except Exception:  # pragma: no cover - the guard must never break a test
+        native = None
+    if native:
+        try:
+            native_resolved = Path(native).resolve()
+        except (OSError, ValueError):
+            native_resolved = None
+        if native_resolved and (resolved == native_resolved
+                                or _is_relative_to(resolved, native_resolved)):
+            return True
+    return False
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -399,6 +461,12 @@ def sandbox_path_for(path: Path, slug: str, leaf: str) -> Optional[Path]:
     So in a test context a resolved board path that is NOT already inside a
     disposable sandbox is redirected into the per-board sandbox. A path that
     already is inside a sandbox is returned as-is (``None`` means "keep it").
+
+    The test's OWN ``HERMES_HOME`` counts as a sandbox (see
+    :func:`_candidate_sandbox_roots`): a test that points ``HERMES_HOME``
+    at a fresh temp dir owns that tree, and its board must resolve THERE —
+    not in the shared per-process sandbox, which would let one test's board
+    leak into the next test's.
     """
     if not running_under_pytest():
         return None
