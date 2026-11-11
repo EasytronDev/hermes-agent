@@ -724,6 +724,30 @@ def _capture_pinned_kanban_roots() -> list[Path]:
 _REAL_KANBAN_ROOTS = [_REAL_KANBAN_ROOT, *_capture_pinned_kanban_roots()]
 
 
+def _publish_deployment_kanban_roots() -> None:
+    """Tell the KERNEL where this deployment keeps its boards.
+
+    Inside a test run every env-derived root is the per-test sandbox:
+    ``HERMES_HOME`` has been rewired, so ``kanban_db.kanban_home()`` resolves
+    to the sandbox and the kernel can no longer tell a live board from a
+    test-owned one. The kernel therefore needs the DEPLOYMENT's roots — the
+    ones captured above, before the sandbox rewired anything.
+
+    Published as ``HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS`` (os.pathsep-separated)
+    because an env var survives into child processes, which is where the
+    incident's damage happened.
+    """
+    roots: list[str] = []
+    for root in _REAL_KANBAN_ROOTS:
+        text = str(root)
+        if text not in roots:
+            roots.append(text)
+    os.environ["HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS"] = os.pathsep.join(roots)
+
+
+_publish_deployment_kanban_roots()
+
+
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target a REAL board root.

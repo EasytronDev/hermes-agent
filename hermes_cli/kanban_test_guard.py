@@ -34,6 +34,13 @@ production path look like a test path. Anything outside those roots is
 treated as a production path — and an unknown path is refused rather than
 trusted, because "unknown" is how a production pin looks when the deployment
 layout is unusual.
+
+THE SANDBOX IS PER BOARD. A refused pin falls back to
+``<sandbox>/<slug>/<leaf>``, not to ``<sandbox>/<leaf>``: two boards that
+collapse onto one file would let a write intended for board A land in board
+B, and would break the repo's own invariant that "workers physically cannot
+see other boards" (a CLI ``--board B`` write must not appear in the pinned
+board's database).
 """
 
 from __future__ import annotations
@@ -41,8 +48,11 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import logging
 from pathlib import Path
 from typing import MutableMapping, Optional
+
+_log = logging.getLogger(__name__)
 
 #: pytest's own temp roots. ``PYTEST_DEBUG_TEMPOROOT`` is the explicit
 #: override; the ``pytest-of-<user>`` tree is where pytest's ``tmp_path``
@@ -65,6 +75,12 @@ _TEST_ISOLATION_HOME_ENV = "HERMES_TEST_SANDBOX_HOME"
 #: scratch and relocates the basetemp out of the operator's home into a
 #: per-run directory).
 _PYTEST_BASETEMP_ENV = "HERMES_TEST_PYTEST_BASETEMP"
+
+#: Published by the hermetic conftest: the board roots of the DEPLOYMENT, as
+#: they were BEFORE the test sandbox rewired ``HERMES_HOME``. This is what
+#: makes "is this pin a live board?" answerable inside a test run, where
+#: every env-derived root is the sandbox itself.
+_DEPLOYMENT_ROOTS_ENV = "HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS"
 
 
 def running_under_pytest() -> bool:
@@ -125,8 +141,7 @@ def _candidate_sandbox_roots() -> list[Path]:
             children = list(tmp_root.glob("pytest-of-*"))
         except OSError:
             children = []
-        for child in children:
-            roots.append(child)
+        roots.extend(children)
         roots.append(tmp_root / "hermes-kanban-test-sandbox")
 
     # The hermetic per-test sandbox home (a tmp_path under the basetemp).
@@ -172,6 +187,45 @@ def pin_points_into_sandbox(pin: str) -> bool:
     return False
 
 
+def _deployment_board_roots() -> list[Path]:
+    """The board roots of THIS deployment, independent of the test sandbox.
+
+    The naive oracle — ``kanban_db.kanban_home()`` — cannot be used here: in a
+    hermetic test run ``HERMES_HOME`` points at the per-test sandbox, so
+    ``kanban_home()`` IS the sandbox. Comparing a pin against it then says
+    "this is a live board" for every legitimate test pin (measured: the repo's
+    own ``test_kanban_board_path_priority.py`` pins a board inside its
+    ``tmp_path`` and the naive oracle called it live), and the kernel refuses
+    a pin it should honor.
+
+    The deployment's roots are therefore taken from the environment as it was
+    BEFORE the hermetic sandbox rewired it. The conftest captures them at
+    import time and publishes them in ``HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS``
+    (a ``os.pathsep``-separated list); the guard falls back to
+    ``HERMES_KANBAN_HOME`` — the one board root the deployment sets
+    explicitly — and, failing that, to the platform-native Hermes root.
+
+    An empty result means "the deployment did not say", and the caller then
+    fails closed: an unknown pin is refused.
+    """
+    roots: list[Path] = []
+
+    def add(value: Optional[str]) -> None:
+        if not value:
+            return
+        try:
+            roots.append(Path(value).expanduser().resolve())
+        except (OSError, ValueError):
+            return
+
+    published = os.environ.get(_DEPLOYMENT_ROOTS_ENV, "").strip()
+    if published:
+        for part in published.split(os.pathsep):
+            add(part)
+    add(os.environ.get("HERMES_KANBAN_HOME", "").strip())
+    return roots
+
+
 def pin_points_at_a_live_board(pin: str) -> bool:
     """True when *pin* names a board of THIS deployment.
 
@@ -200,25 +254,19 @@ def pin_points_at_a_live_board(pin: str) -> bool:
     except (OSError, ValueError):
         return False
 
-    # The deployment's board roots.
-    try:
-        from hermes_cli import kanban_db as kb
-
-        home = kb.kanban_home().resolve()
-    except Exception:
-        return False
-    live_roots = (
-        home,                                  # <home>/kanban.db and <home>/kanban/boards/...
-        home / "kanban",
-        home / "kanban" / "boards",
-    )
-    for root in live_roots:
-        try:
-            resolved_root = root.resolve()
-        except (OSError, ValueError):
-            continue
-        if target == resolved_root or _is_relative_to(target, resolved_root):
-            return True
+    for home in _deployment_board_roots():
+        live_roots = (
+            home,                                  # <home>/kanban.db and <home>/kanban/boards/...
+            home / "kanban",
+            home / "kanban" / "boards",
+        )
+        for root in live_roots:
+            try:
+                resolved_root = root.resolve()
+            except (OSError, ValueError):
+                continue
+            if target == resolved_root or _is_relative_to(target, resolved_root):
+                return True
     return False
 
 
@@ -255,6 +303,40 @@ def reset_sandbox_board_root() -> None:
     """Forget the cached sandbox root (tests that fork or re-point TMPDIR)."""
     global _SANDBOX_BOARD_ROOT
     _SANDBOX_BOARD_ROOT = None
+
+
+def sandbox_board_path(slug: str, leaf: str, pin_var: str = "<pin>") -> Path:
+    """The sandboxed path for board *slug* — ``<sandbox>/<slug>/<leaf>``.
+
+    PER BOARD, not per process: a single file per process would collapse every
+    board onto one database, and the repo's own invariant — "workers
+    physically cannot see other boards" — depends on two boards resolving to
+    two different files. The repo's ``test_cli_board_flag_trumps_worker_env_pin_end_to_end``
+    fails outright if they collapse: a CLI ``--board B`` write would show up
+    in the worker's own pinned board.
+    """
+    safe_slug = _safe_slug(slug)
+    path = sandbox_board_root() / safe_slug / leaf
+    _log.warning(
+        "kanban path pin %s refused: this process is running under a test suite "
+        "and the pin does not point inside a disposable sandbox. Falling back to "
+        "the per-process, per-board test sandbox (%s) so the test cannot write "
+        "into a live board.",
+        pin_var,
+        path,
+    )
+    return path
+
+
+def _safe_slug(slug: str) -> str:
+    """A slug that is safe to use as a directory name.
+
+    The slug normally comes from the kernel's own normalization, but the
+    sandbox path must never be able to escape the sandbox root, so anything
+    that is not a plain slug token is replaced.
+    """
+    cleaned = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in (slug or "").strip())
+    return cleaned or "default"
 
 
 #: The path pins that must never survive into a test run.

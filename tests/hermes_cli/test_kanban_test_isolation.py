@@ -77,14 +77,26 @@ def live_board_dir(tmp_path, monkeypatch):
     put a board — so it cannot stand in for a live board here. The directory
     is created under a sibling of the temp root that the guard does not
     claim, and cleaned up by the test.
+
+    THE GUARD CLAIMS (see ``hermes_cli.kanban_test_guard``):
+      * ``<tmp>/pytest-of-<user>/``   — pytest's own per-user tree
+      * ``<tmp>/hermes-kanban-test-sandbox/`` — the guard's own sandbox
+      * pytest's basetemp and the hermetic isolation home
+
+    So the live board goes in ``<tmp>/hermes-kanban-live-boards-<pid>/`` — a
+    sibling of the claimed trees, NOT under ``pytest-of-*``. Putting it under
+    ``pytest-of-*`` (the natural "just use tmp_path.parent" move) is exactly
+    the mistake this fixture's docstring used to make: the board then lives
+    INSIDE a claimed sandbox, the guard honors the pin as a legitimate test
+    pin, and the test that is supposed to prove the refusal proves nothing.
     """
-    root = Path(tmp_path).parent / "live-boards-not-a-sandbox"
+    root = Path(tempfile.gettempdir()) / f"hermes-kanban-live-boards-{os.getpid()}"
     target = root / f"board-{os.getpid()}"
     target.mkdir(parents=True, exist_ok=True)
     yield target
     import shutil
 
-    shutil.rmtree(target, ignore_errors=True)
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _seed_board(path: Path, tasks: int = 7) -> None:
@@ -384,6 +396,7 @@ def test_a_worker_environment_cannot_reach_a_live_board_through_a_child_process(
             text=True,
             timeout=120,
             cwd=str(repo_root),
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         resolved = result.stdout.strip().splitlines()[-1]

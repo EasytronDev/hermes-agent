@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli import kanban_test_guard
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -551,26 +552,14 @@ def _board_path(
     board, else ``board_dir(slug)/leaf``.
 
     In a TEST context a pin is honored only when it points inside a disposable
-    sandbox (:mod:`hermes_cli.kanban_test_guard`). A worker-inherited pin at a
-    live board path is refused here, and the resolution then falls back to the
-    guard's per-process sandbox directory — NOT to the kernel's own board root,
-    which in a worker environment resolves straight into the live deployment.
-    A test suite therefore cannot write into a board it does not own."""
+    sandbox (:mod:`hermes_cli.kanban_test_guard`); a worker-inherited pin at a
+    live board is refused and falls back to the guard's per-board sandbox."""
     pin = os.environ.get(env_var, "").strip() if env_var else ""
-    if pin:
-        from hermes_cli import kanban_test_guard
-
-        if kanban_test_guard.pinned_path_is_refused(pin):
-            _log.warning(
-                "kanban path pin %s=%s refused: this process is running under a test "
-                "suite and the pin does not point inside a disposable sandbox. Falling "
-                "back to the per-process test sandbox so the test cannot write into a "
-                "live board.",
-                env_var or "<pin>",
-                pin,
-            )
-            return kanban_test_guard.sandbox_board_root() / leaf
     slug = _explicit_board_slug(board)
+    if pin and kanban_test_guard.pinned_path_is_refused(pin):
+        return kanban_test_guard.sandbox_board_path(
+            slug or get_current_board(), leaf, pin_var=env_var or "<pin>",
+        )
     if pin and (slug is None or _explicit_board_intent_pinned()):
         return Path(pin).expanduser()
     if slug is None:
