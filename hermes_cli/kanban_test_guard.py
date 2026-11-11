@@ -14,17 +14,26 @@ write into a board it does not own.
 
 The rule: **in a test context, a path pin is only honored when it points inside
 a disposable sandbox.** A pin at a production board path is refused, and the
-resolution falls back to the board the kernel would have chosen on its own
-(``<root>/kanban.db`` / ``<root>/kanban/boards/<slug>/``). Refusing — rather
+resolution falls back to a PER-PROCESS SANDBOX DIRECTORY
+(``<temp>/hermes-kanban-test-sandbox/pid-<pid>/``) — deliberately NOT to the
+board the kernel would have chosen on its own, because in a worker
+environment that board IS the live deployment (``HERMES_KANBAN_BOARD`` plus
+the platform default resolve straight into production). Refusing — rather
 than raising — keeps every legitimate use working: the pin is a convenience
 override, not a contract, so a test that pins into ``tmp_path`` keeps its
 behavior and a test that inherited a production pin gets the sandbox instead.
 
-The sandbox set is deliberately generous but never includes a live board root:
-``TMPDIR`` (and its ``TMP``/``TEMP`` aliases), pytest's own basetemp
-(``PYTEST_DEBUG_TEMPOROOT`` and the ``/tmp/pytest-of-*`` tree), and the
-per-test ``tmp_path`` roots pytest hands out. Anything else is treated as a
-production path.
+The sandbox set is deliberately narrow, because a generous one re-opens the
+hole this module closes. It is: pytest's own basetemp (published by the
+hermetic conftest as ``HERMES_TEST_PYTEST_BASETEMP``, or
+``PYTEST_DEBUG_TEMPOROOT``), pytest's ``pytest-of-<user>`` tree, the
+hermetic isolation home, and this module's own sandbox directory.
+``TMPDIR`` itself is NOT a sandbox root: on a deployment whose ``TMPDIR``
+happens to be the same tree the board lives in, claiming it would make every
+production path look like a test path. Anything outside those roots is
+treated as a production path — and an unknown path is refused rather than
+trusted, because "unknown" is how a production pin looks when the deployment
+layout is unusual.
 """
 
 from __future__ import annotations

@@ -776,7 +776,7 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
                 f"kanban_write_guard: kanban DB path resolved to {resolved}, "
                 f"which is under the REAL kanban root ({_root}). "
                 f"Hermetic isolation has been bypassed — refusing to write "
-                f"to the real ~/.hermes. See #69283."
+                f"to a live board. See #69283."
             )
         return _orig_connect(db_path, *args, **kwargs)
 
