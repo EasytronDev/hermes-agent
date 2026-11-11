@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
+from agent.credential_pool_cooldowns import (
+    CredentialPoolSelectionMixin,
+    PoolSkip,
+    exhausted_ttl,
+    exhausted_until,
+)
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
 
 import logging
@@ -29,7 +35,6 @@ from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
-from agent.credential_pool_validation import manual_pool_credential_defect, reference_credential_length
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth_oauth_grants import owned_profile_reads_root_state
 from hermes_cli.auth import (
@@ -369,36 +374,6 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(
-    error_code: Optional[int],
-    *,
-    sole_credential: bool = False,
-    failure_reason: Optional[str] = None,
-) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion.
-
-    *sole_credential*: the pool has nothing to rotate to, so transient
-    throttles (429 and the catch-all default covering 403/5xx/unknown) are
-    capped to a brief cooldown; 401 keeps its own already-short TTL.
-
-    *failure_reason* is the classifier verdict: an OpenRouter ``key limit
-    exceeded`` and an xAI spending block both arrive as 403 but are billing,
-    and a 60s retry on a spent account just re-fails. Billing keeps the full
-    bench regardless of status; 402 is billing by definition.
-    Unverified billing (#82154) gets the short cooldown regardless of pool
-    size (the credential may be healthy), unless the status is a true 402.
-    """
-    if error_code == 401:
-        return EXHAUSTED_TTL_401_SECONDS
-    base = EXHAUSTED_TTL_429_SECONDS if error_code == 429 else EXHAUSTED_TTL_DEFAULT_SECONDS
-    if failure_reason == FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
-        return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
-    is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
-    if sole_credential and not is_billing:
-        return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
-    return base
-
-
 def _singleton_predates_entry(state: Any, entry: PooledCredential) -> bool:
     """True only when the auth.json singleton is PROVABLY older than *entry*.
 
@@ -441,18 +416,12 @@ def _normalize_error_context(error_context: Optional[dict[str, Any]]) -> dict[st
 
 
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:
-    if entry.last_status != STATUS_EXHAUSTED:
-        return None
-    reset_at = _parse_absolute_timestamp(entry.last_error_reset_at)
-    if reset_at is not None:
-        return reset_at
-    if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(
-            entry.last_error_code,
-            sole_credential=sole_credential,
-            failure_reason=entry.failure_reason,
-        )
-    return None
+    return exhausted_until(entry, sole_credential=sole_credential)
+
+
+# The cooldown sizing lives in ``agent.credential_pool_cooldowns``; these
+# aliases keep the historical private names importable from this module.
+_exhausted_ttl = exhausted_ttl
 
 
 # --- Custom (OpenAI-compatible) endpoint pool keys ---
@@ -964,7 +933,11 @@ class _RefreshDone(Exception):
         self.result = result
 
 
-class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
+class CredentialPool(
+    CredentialPoolAdminMixin,
+    CredentialPoolModelCooldownMixin,
+    CredentialPoolSelectionMixin,
+):
     def __init__(self, provider: str, entries: list[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
@@ -985,6 +958,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS). Re-armed to None on every
         # successful selection so a recover->re-exhaust transition logs promptly.
         self._last_no_entries_log_at: Optional[float] = None
+        # Why the last selection skipped each entry (reason, entry id, detail).
+        # Read by _log_no_available_entries() to name the actual cause of an
+        # empty pool instead of printing a generic "all exhausted or empty".
+        self._last_skip_reasons: list[PoolSkip] = []
         # #70401: consecutive mark_exhausted_and_rotate() calls whose supplied
         # credential identity matched no pool entry. These mark nothing
         # exhausted, so without a cap the pool never converges to "no available
@@ -2028,112 +2005,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return self._sync_nous_entry_from_auth_store(entry)
         return self._sync_entry_from_auth_store(entry)
 
-    def _available_entries(
-        self, *, clear_expired: bool = False, refresh: bool = False, model: Optional[str] = None,
-    ) -> tuple[list[PooledCredential], list[PooledCredential]]:
-        """Return (available, pending_refresh) for entries not in cooldown.
-
-        *clear_expired* resets elapsed cooldowns to STATUS_OK and persists.
-        *refresh* refreshes entries needing a token refresh (skipped on
-        failure) — except single-use-token providers (openai-codex,
-        xai-oauth), which are returned as *pending_refresh* so the caller
-        refreshes them outside the lock instead of stalling every pool
-        consumer during cross-process flock acquisition + OAuth network I/O.
-        """
-        now = time.time()
-        cleared_any = False
-        entries_to_prune: list[str] = []
-        available: list[PooledCredential] = []
-        pending_refresh: list[PooledCredential] = []
-        sole_credential = self._is_sole_credential()
-        # The pool's own owner-provided credential (``env:``/``config:``/``model_config``) is the
-        # evidence a ``manual`` row is measured against: a real key for a provider whose
-        # configured key is 125 characters is not 20 characters. No reference, no judgement.
-        reference_length = reference_credential_length(self._entries)
-        for entry in self._entries:
-            # Borrowed credentials persist as metadata-only references and are
-            # hydrated from their live source on load; never lease an
-            # unhydrated duplicate as an empty key.
-            if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
-                continue
-            # A row that cannot be a credential for this provider is skipped, not selected: a
-            # store written before the write-time check existed (or by a tool that never had it)
-            # must not be able to put a 401 in front of a healthy sibling. The write-time refusal
-            # (``add_entry``) is the first line of defence; this is the one that protects a pool
-            # that was already on disk when the incident of 2026-11-10 was diagnosed.
-            if manual_pool_credential_defect(self.provider, entry, reference_length=reference_length) is not None:
-                continue
-            synced = self._resync_stale_entry(entry)
-            if synced is not entry:
-                entry = synced
-                cleared_any = True
-            if entry.last_status == STATUS_DEAD:
-                # Manual DEAD credentials are pruned after a 24h quiet window;
-                # singleton-seeded ones stay (audit trail, and the seeder would
-                # re-create them anyway). DEAD never re-enters via TTL — only a
-                # write-side re-auth sync clears it.
-                if _is_manual_source(entry.source):
-                    dead_at = entry.last_status_at or 0
-                    if dead_at and now - dead_at > DEAD_MANUAL_PRUNE_TTL_SECONDS:
-                        logger.warning(
-                            "credential pool: pruning DEAD manual entry %s "
-                            "(reason=%s, age=%.1fh) — re-add via `hermes auth add %s`",
-                            entry.label or entry.id[:8],
-                            entry.last_error_reason or "unknown",
-                            (now - dead_at) / 3600.0,
-                            self.provider,
-                        )
-                        entries_to_prune.append(entry.id)  # can't mutate while iterating
-                        cleared_any = True
-                continue
-            if model_cooldown_until(entry, model) is not None:
-                continue
-            if entry.last_status == STATUS_EXHAUSTED:
-                exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
-                # Codex quota windows can reopen EARLY; a throttled live probe
-                # lifts a stale cooldown (issue #43747).
-                if (
-                    exhausted_until is not None
-                    and now < exhausted_until
-                    and not (clear_expired and self._codex_quota_restored_upstream(entry))
-                ):
-                    continue
-                if clear_expired:
-                    # The probe may have rotated this row's single-use token pair: clear the
-                    # cooldown on the live row, not on this pre-probe copy.
-                    entry = self._find(lambda e, i=entry.id: e.id == i) or entry
-                    entry = self._adopt(entry, persist=False, **_MARK_OK)
-                    cleared_any = True
-            if refresh and self._entry_needs_refresh(entry):
-                if self.provider in _TOKENS_SINGLETON_PROVIDERS:
-                    pending_refresh.append(entry)
-                    continue
-                refreshed = self._refresh_entry(entry, force=False)
-                if refreshed is None:
-                    continue
-                entry = refreshed
-            if entry.auth_type == AUTH_TYPE_OAUTH and not (entry.access_token or "").strip():
-                # A borrowed OAuth row that failed to hydrate (or a sanitized
-                # row read straight off disk); leasing it would send an empty
-                # bearer. The API-key guard above does not cover it.
-                continue
-            available.append(entry)
-        if entries_to_prune:
-            pruned_ids = set(entries_to_prune)
-            self._entries = [e for e in self._entries if e.id not in pruned_ids]
-        if cleared_any:
-            self._persist(removed_ids=entries_to_prune)
-        return available, pending_refresh
-
-    def _log_no_available_entries(self) -> None:
-        """Emit the empty-pool INFO line at most once per throttle window."""
-        now = time.monotonic()
-        last = self._last_no_entries_log_at
-        if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
-            return
-        self._last_no_entries_log_at = now
-        logger.info("credential pool %s: no available entries (all exhausted or empty)", self.provider)
-
     def _select_unlocked(
         self, *, refresh: bool = True, count: bool = True, model: Optional[str] = None,
     ) -> tuple[Optional[PooledCredential], list[PooledCredential]]:
@@ -2322,7 +2193,26 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     _label, status_code, updated_entry.last_error_reason or "unknown",
                 )
             else:
-                logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
+                # Report how long the credential stays benched. The cooldown is
+                # 60s for a sole credential on a transient throttle and a full
+                # hour for a billing-classified failure, and a reader of the
+                # log could not tell those apart from "exhausted, rotating" —
+                # so nobody could say whether rotation was possible in a minute
+                # or in an hour. The TTL is recomputed from the *updated*
+                # entry, exactly as the selection path will compute it.
+                _sole = self._is_sole_credential()
+                _ttl = _exhausted_ttl(
+                    updated_entry.last_error_code,
+                    sole_credential=_sole,
+                    failure_reason=updated_entry.failure_reason,
+                )
+                logger.info(
+                    "credential pool: marking %s exhausted (status=%s) ttl=%ds reason=%s "
+                    "sole_credential=%s, rotating",
+                    _label, status_code, _ttl,
+                    updated_entry.failure_reason or "unclassified",
+                    _sole,
+                )
             self._current_id = None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry is not None and next_entry.id == entry.id:
