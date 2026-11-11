@@ -548,8 +548,28 @@ def _board_path(
     watcher / dispatcher ticks) and dispatched or delegated workers keep
     resolving through the pin. Without explicit intent the ``env_var`` override
     pins the file, else legacy ``<root>/<default_parts>`` for the ``default``
-    board, else ``board_dir(slug)/leaf``."""
+    board, else ``board_dir(slug)/leaf``.
+
+    In a TEST context a pin is honored only when it points inside a disposable
+    sandbox (:mod:`hermes_cli.kanban_test_guard`). A worker-inherited pin at a
+    live board path is refused here, and the resolution then falls back to the
+    guard's per-process sandbox directory — NOT to the kernel's own board root,
+    which in a worker environment resolves straight into the live deployment.
+    A test suite therefore cannot write into a board it does not own."""
     pin = os.environ.get(env_var, "").strip() if env_var else ""
+    if pin:
+        from hermes_cli import kanban_test_guard
+
+        if kanban_test_guard.pinned_path_is_refused(pin):
+            _log.warning(
+                "kanban path pin %s=%s refused: this process is running under a test "
+                "suite and the pin does not point inside a disposable sandbox. Falling "
+                "back to the per-process test sandbox so the test cannot write into a "
+                "live board.",
+                env_var or "<pin>",
+                pin,
+            )
+            return kanban_test_guard.sandbox_board_root() / leaf
     slug = _explicit_board_slug(board)
     if pin and (slug is None or _explicit_board_intent_pinned()):
         return Path(pin).expanduser()
