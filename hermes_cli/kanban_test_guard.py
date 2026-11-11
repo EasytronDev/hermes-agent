@@ -384,6 +384,29 @@ def pinned_path_is_refused(pin: str) -> bool:
     return not pin_points_into_sandbox(pin)
 
 
+def sandbox_path_for(path: Path, slug: str, leaf: str) -> Optional[Path]:
+    """The sandboxed twin of *path*, or ``None`` when *path* is fine.
+
+    The other half of the fail-closed rule: a pin is not the only way into a
+    live board. With NO pin set, the board's own directory resolves under
+    the deployment's root (``HERMES_KANBAN_HOME`` or the platform root) —
+    and inside a test run that root is the DEPLOYMENT's, not the test's.
+    Measured on a fake deployment root: every resolver (``kanban_db_path``,
+    ``workspaces_root``, ``attachments_root``, ``worker_logs_dir``) landed
+    inside the deployment tree with no pin at all, which is the same class
+    of damage as the 2026-11-10 wipe (a test writing where it must not).
+
+    So in a test context a resolved board path that is NOT already inside a
+    disposable sandbox is redirected into the per-board sandbox. A path that
+    already is inside a sandbox is returned as-is (``None`` means "keep it").
+    """
+    if not running_under_pytest():
+        return None
+    if pin_points_into_sandbox(str(path)):
+        return None
+    return sandbox_board_path(slug, leaf, pin_var="<board path>")
+
+
 def resolve_pinned_path(
     pin: str, slug: str, leaf: str, pin_var: str = "<pin>",
     pin_wins: bool = True,

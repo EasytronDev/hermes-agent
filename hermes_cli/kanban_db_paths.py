@@ -111,5 +111,15 @@ def board_path(
     if slug is None:
         slug = kb.get_current_board()
     if slug == kb.DEFAULT_BOARD:
-        return kb.kanban_home().joinpath(*default_parts)
-    return kb.board_dir(slug) / leaf
+        path = kb.kanban_home().joinpath(*default_parts)
+    else:
+        path = kb.board_dir(slug) / leaf
+    # No pin won, so the board's OWN directory was resolved. In a test run
+    # that directory belongs to the deployment (``HERMES_KANBAN_HOME`` or the
+    # platform root), NOT to the test — and the 2026-11-10 incident is
+    # exactly a test writing there. Fail closed: a test resolves into the
+    # sandbox instead.
+    sandboxed = kanban_test_guard.sandbox_path_for(path, slug, leaf)
+    if sandboxed is not None:
+        return sandboxed
+    return path

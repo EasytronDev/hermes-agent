@@ -280,6 +280,49 @@ def test_a_pin_at_a_deployment_board_is_refused_even_inside_the_sandbox(
     )
 
 
+def test_no_pin_at_all_still_resolves_into_the_sandbox(monkeypatch, live_board_dir):
+    """A pin is NOT the only way into a live board.
+
+    With NO pin set, the board's own directory resolves under the
+    deployment's root — and inside a test run that root is the DEPLOYMENT's.
+    Measured on the base: every resolver (``kanban_db_path``,
+    ``workspaces_root``, ``attachments_root``, ``worker_logs_dir``) landed
+    inside the deployment tree, which is the same class of damage as the
+    2026-11-10 wipe. Fail closed: a test resolves into the sandbox.
+
+    The deployment root lives OUTSIDE every claimed sandbox (the
+    ``live_board_dir`` fixture), because a board under ``tmp_path`` is
+    test-owned and must keep resolving there.
+    """
+    deployment_root = live_board_dir / "deployment"
+    (deployment_root / "kanban" / "boards" / "prod-board").mkdir(parents=True)
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::test_y (call)")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(deployment_root))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "prod-board")
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    for name, path in (
+        ("kanban_db_path", kb.kanban_db_path()),
+        ("kanban_db_path(board=other)", kb.kanban_db_path(board="other")),
+        ("workspaces_root", kb.workspaces_root()),
+        ("attachments_root", kb.attachments_root()),
+        ("worker_logs_dir", kb.worker_logs_dir()),
+    ):
+        assert not str(path).startswith(str(deployment_root)), (
+            f"{name} resolved into the deployment tree ({path}) — a test run "
+            f"must never write there"
+        )
+        assert ktg.pin_points_into_sandbox(str(path)), (
+            f"{name} resolved to {path}, which is not inside a disposable sandbox"
+        )
+
+
 # ── The test with teeth ─────────────────────────────────────────────────────
 
 
