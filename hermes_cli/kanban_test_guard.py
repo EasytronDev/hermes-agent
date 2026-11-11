@@ -370,22 +370,46 @@ def pinned_path_is_refused(pin: str) -> bool:
     """True when *pin* must NOT be honored because this is a test run and the
     pin points at a board the test does not own.
 
-    This is the kernel's fail-closed rule. In a test context a pin is honored
-    only when it resolves inside a disposable sandbox; a pin at a LIVE board of
-    this deployment is refused outright, whatever the temp-dir layout is.
-
-    Two independent reasons to refuse:
-
-    1. the pin names a live board (see :func:`pin_points_at_a_live_board`) —
-       decisive, and the check that closes the 2026-11-10 incident;
-    2. the pin names neither a sandbox nor a live board — an unknown path is
-       refused rather than trusted, because "unknown" is how a production pin
-       looks when the deployment layout is unusual.
+    In a test context a pin is honored only when it resolves inside a
+    disposable sandbox; a pin at a LIVE board of this deployment is refused
+    outright, whatever the temp-dir layout is, and so is a pin that names
+    neither a sandbox nor a live board — an unknown path is refused rather
+    than trusted, because "unknown" is how a production pin looks when the
+    deployment layout is unusual.
     """
-    if not pin:
-        return False
-    if not running_under_pytest():
+    if not pin or not running_under_pytest():
         return False
     if pin_points_at_a_live_board(pin):
         return True
     return not pin_points_into_sandbox(pin)
+
+
+def resolve_pinned_path(
+    pin: str, slug: str, leaf: str, pin_var: str = "<pin>",
+    pin_wins: bool = True,
+) -> Optional[Path]:
+    """Resolve *pin* for a test run: the path the caller must use.
+
+    This is the kernel's fail-closed rule, in one place. In a test context a
+    pin is honored ONLY when it resolves inside a disposable sandbox. A pin at
+    a LIVE board of this deployment is refused outright, whatever the
+    temp-dir layout is, and so is a pin that names neither a sandbox nor a
+    live board — an unknown path is refused rather than trusted, because
+    "unknown" is how a production pin looks when the deployment layout is
+    unusual.
+
+    Returns the SANDBOXED path when the pin is refused, and the pin itself
+    when it may be honored. Returns ``None`` when there is no pin, or when
+    this is not a test run at all and the caller's own ``pin_wins`` rule does
+    not select the pin — the caller then resolves its board normally.
+
+    *slug* is the board the caller asked for (or the active one), *pin_wins*
+    whether the caller's own rules select the pin over that board.
+    """
+    if not pin:
+        return None
+    if not running_under_pytest():
+        return Path(pin).expanduser() if pin_wins else None
+    if pinned_path_is_refused(pin):
+        return sandbox_board_path(slug, leaf, pin_var=pin_var)
+    return Path(pin).expanduser() if pin_wins else None

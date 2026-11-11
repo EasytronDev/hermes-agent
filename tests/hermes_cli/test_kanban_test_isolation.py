@@ -206,6 +206,80 @@ def test_sandbox_fallback_is_stable_and_disposable(monkeypatch):
         ktg.reset_sandbox_board_root()
 
 
+def test_the_sandbox_fallback_is_PER_BOARD_not_one_file_for_every_board(
+    monkeypatch, live_board_dir
+):
+    """Two boards must not collapse onto one database in the sandbox.
+
+    The first version of the guard fell back to ``<sandbox>/<leaf>`` — one
+    file for the whole process — so a CLI ``--board target-board`` write
+    landed in the worker's own pinned board and the repo's own
+    ``test_cli_board_flag_trumps_worker_env_pin_end_to_end`` failed
+    (14 passed -> 1 failed). The fallback is per board.
+    """
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::test_y (call)")
+    live_board = live_board_dir / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
+
+    one = kb.kanban_db_path(board="board-one")
+    two = kb.kanban_db_path(board="board-two")
+
+    assert one != two, (
+        f"two boards collapsed onto one file ({one}) — a write meant for one "
+        f"board would land in the other"
+    )
+    assert "board-one" in str(one), f"the fallback lost the board slug: {one}"
+    assert "board-two" in str(two), f"the fallback lost the board slug: {two}"
+    assert ktg.pin_points_into_sandbox(str(one))
+    assert ktg.pin_points_into_sandbox(str(two))
+
+
+def test_a_legitimate_test_pin_inside_the_tmp_path_is_still_honored(
+    monkeypatch, tmp_path
+):
+    """The live-board oracle must not call EVERY pin live.
+
+    The first version compared the pin against ``kanban_db.kanban_home()``,
+    which inside a hermetic test run IS the per-test sandbox — so every
+    legitimate test pin looked like a live board and was refused. The oracle
+    now reads the DEPLOYMENT's roots (published by the conftest), not the
+    sandbox's.
+    """
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::test_y (call)")
+    pinned = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    assert kb.kanban_db_path() == pinned, (
+        "a pin inside the test's own tmp_path must be honored — the guard must "
+        "not refuse every pin it sees"
+    )
+
+
+def test_a_pin_at_a_deployment_board_is_refused_even_inside_the_sandbox(
+    monkeypatch, tmp_path
+):
+    """A deployment board is refused even when it sits under a temp dir.
+
+    The deployment's roots are published by the conftest; a board under one
+    of them is a LIVE board whatever the temp layout is, and a test must
+    never write into it.
+    """
+    deployment_root = tmp_path / "deployment"
+    deployment_root.mkdir()
+    deployment_db = deployment_root / "kanban.db"
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::test_y (call)")
+    monkeypatch.setenv("HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS", str(deployment_root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(deployment_db))
+
+    assert ktg.pin_points_at_a_live_board(str(deployment_db))
+    assert ktg.pinned_path_is_refused(str(deployment_db))
+    resolved = kb.kanban_db_path()
+    assert resolved != deployment_db, (
+        f"the kernel resolved the live board {deployment_db} under test"
+    )
+
+
 # ── The test with teeth ─────────────────────────────────────────────────────
 
 

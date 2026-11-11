@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from hermes_cli import kanban_test_guard
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -504,20 +503,10 @@ def board_exists(board: Optional[str] = None) -> bool:
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
     """Explicit caller intent: a direct ``board=`` argument, else the scoped
     ``--board`` context (CLI ``hermes kanban --board``, dashboard plugin_api);
-    ``None`` when the caller expressed neither."""
-    if board is not None:
-        return _normalize_board_slug(board)
-    # A caller-scoped board (CLI `hermes kanban --board B ...`, dashboard
-    # plugin_api) is explicit intent just like a direct board= argument —
-    # without this a worker-pinned HERMES_KANBAN_DB silently outranks --board
-    # (os-reviewer P1 on PR#107195 / t_11c4afd8).
-    ctx = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
-    if ctx:
-        try:
-            return _normalize_board_slug(ctx)
-        except ValueError:
-            return None
-    return None
+    ``None`` when the caller expressed neither. Lives in
+    :mod:`hermes_cli.kanban_db_paths`."""
+    from hermes_cli import kanban_db_paths
+    return kanban_db_paths._explicit_board_slug(board)
 
 
 def _explicit_board_intent_pinned() -> bool:
@@ -531,42 +520,19 @@ def _explicit_board_intent_pinned() -> bool:
     physically cannot see other boards" isolation (5ec6baa), and
     ``agent.delegation_context.kanban_path_is_fenced`` checks the pinned path /
     fenced root — an explicit board that resolved elsewhere would also escape
-    that fence."""
-    if _PIN_FIRST_BOARD_RESOLUTION.get():
-        return True
-    from agent.delegation_context import explicit_board_intent_is_pinned
-    return explicit_board_intent_is_pinned()
+    that fence. Lives in :mod:`hermes_cli.kanban_db_paths`."""
+    from hermes_cli import kanban_db_paths
+    return kanban_db_paths._explicit_board_intent_pinned()
 
 
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
-    """Shared resolver. An explicit ``board=`` argument — or the scoped
-    ``--board`` context (:func:`scoped_current_board`) — outranks the ``env_var``
-    pin ONLY where no fence applies (see :func:`_explicit_board_intent_pinned`):
-    user-facing cross-board intent (CLI ``--board``, a model tool's ``board=``)
-    is honored, but machine flows that enumerate boards (gateway notifier /
-    watcher / dispatcher ticks) and dispatched or delegated workers keep
-    resolving through the pin. Without explicit intent the ``env_var`` override
-    pins the file, else legacy ``<root>/<default_parts>`` for the ``default``
-    board, else ``board_dir(slug)/leaf``.
-
-    In a TEST context a pin is honored only when it points inside a disposable
-    sandbox (:mod:`hermes_cli.kanban_test_guard`); a worker-inherited pin at a
-    live board is refused and falls back to the guard's per-board sandbox."""
-    pin = os.environ.get(env_var, "").strip() if env_var else ""
-    slug = _explicit_board_slug(board)
-    if pin and kanban_test_guard.pinned_path_is_refused(pin):
-        return kanban_test_guard.sandbox_board_path(
-            slug or get_current_board(), leaf, pin_var=env_var or "<pin>",
-        )
-    if pin and (slug is None or _explicit_board_intent_pinned()):
-        return Path(pin).expanduser()
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home().joinpath(*default_parts)
-    return board_dir(slug) / leaf
+    """Shared resolver for a board's path. The rules live in
+    :mod:`hermes_cli.kanban_db_paths` (a topical sibling: this facade had
+    grown past the repository's per-file line cap)."""
+    from hermes_cli import kanban_db_paths
+    return kanban_db_paths.board_path(env_var, board, default_parts, leaf)
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
