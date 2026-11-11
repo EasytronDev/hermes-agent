@@ -16,6 +16,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
+from agent.credential_pool_validation import (
+    FAILURE_CAUSE_INVALID_API_KEY,
+    FAILURE_CAUSE_POOL_CREDENTIAL_INVALID,
+)
+
 logger = logging.getLogger(__name__)
 
 # Synthetic code for the OpenAI SDK rejecting a provider's SSE ``data:`` field
@@ -99,6 +104,22 @@ class ClassifiedError:
     def billing_unverified(self) -> bool:
         """True when a ``billing`` verdict rests on an ambiguous body (#82154)."""
         return bool(self.error_context.get("billing_unverified"))
+
+    @property
+    def failure_cause(self) -> str:
+        """The credential-cause code behind an auth verdict.
+
+        ``missing_api_key`` — no key was sent (the runtime refused before the request).
+        ``invalid_api_key`` — a key was sent and the provider rejected it.
+        ``pool_credential_invalid`` — the key that was sent came from a credential-pool row
+        that cannot be a key for this provider.
+
+        The auth copy used to read "rejected your API key" for all three, so a board could not
+        tell a corrected cause (promote) from a quota wall (do not promote). The code rides the
+        rendered error text, which is what the Kanban dispatcher stores in
+        ``last_failure_error``.
+        """
+        return str(self.error_context.get("failure_cause") or "")
 
 
 # ── Pattern tables (lowercased substrings) ──────────────────────────────
@@ -1152,7 +1173,55 @@ def classify_api_error(
         if host:
             message = f"{message} (endpoint: {host})"
     base = {"status_code": status_code, "provider": provider, "model": model, "message": message}
-    return ClassifiedError(**{**base, **verdict})
+    classified = ClassifiedError(**{**base, **verdict})
+    if classified.is_auth:
+        # Name the credential cause so the board can tell a corrected cause (promote the card)
+        # from a wall no retry heals (leave it parked). A 401 means a key WAS sent and the
+        # provider refused it; the runtime's own refusal (no key at all) never reaches here —
+        # it is an ``AuthError`` with code ``missing_api_key``.
+        cause = _credential_failure_cause(provider, api_key)
+        classified.error_context.setdefault("failure_cause", cause)
+    return classified
+
+
+def _credential_failure_cause(provider: str, api_key: Any) -> str:
+    """Which credential failure this is: a defective pool row, or the key itself.
+
+    ``pool_credential_invalid`` — the key that was sent is a credential-pool row that
+    cannot be a key for this provider (judged against the pool's own owner-provided
+    credential). The remedy is to fix the pool, not to rotate the key.
+
+    ``invalid_api_key`` — a key was sent and the provider refused it.
+
+    The pool's own selection rule already refuses to LEASE such a row, so this branch
+    covers what that rule cannot reach: a store written before the check existed, or one
+    written by a tool that never had it (2026-11-10: two 20-character ``manual`` rows
+    ahead of the real key in one profile's pool, and the board could not tell "the pool
+    holds a malformed row" from "the key is wrong").
+    """
+    if not provider or not api_key:
+        return FAILURE_CAUSE_INVALID_API_KEY
+    try:
+        from hermes_cli.auth import read_credential_pool
+        from agent.credential_pool_validation import (
+            manual_pool_credential_defect, reference_credential_length,
+        )
+
+        rows = read_credential_pool(provider)
+        if not rows:
+            return FAILURE_CAUSE_INVALID_API_KEY
+        reference = reference_credential_length(rows)
+        for row in rows:
+            secret = row.get("access_token") if isinstance(row, dict) else None
+            if not isinstance(secret, str) or not secret or secret != api_key:
+                continue
+            if manual_pool_credential_defect(provider, row, reference_length=reference) is not None:
+                return FAILURE_CAUSE_POOL_CREDENTIAL_INVALID
+            break
+    except Exception:  # noqa: BLE001
+        # The pool is not readable here; the generic cause still holds.
+        return FAILURE_CAUSE_INVALID_API_KEY
+    return FAILURE_CAUSE_INVALID_API_KEY
 
 
 def _shape_context(c: _Ctx, verdict: Verdict, *, hooked: bool) -> dict[str, Any]:

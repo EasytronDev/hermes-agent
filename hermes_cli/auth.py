@@ -448,6 +448,15 @@ _GENERIC_ENTITLEMENT_MESSAGES = {
 _ENTITLEMENT_ERROR_CODES = frozenset(_GENERIC_ENTITLEMENT_MESSAGES) | {
     "subscription_expired", "no_usable_credits", "account_missing", "member_spend_cap_exceeded"}
 
+# Credential-cause codes: the stable token that says WHICH credential failure this was. The
+# rendered text is what a board stores in ``last_failure_error``, and without the token
+# "no key was sent" and "the key was refused" both read as "rejected your API key".
+_CREDENTIAL_CAUSE_CODES = frozenset({
+    "missing_api_key",       # the runtime refused before the request: NO key was sent
+    "invalid_api_key",       # a key was sent and the provider rejected it
+    "pool_credential_invalid",  # the key came from a pool row that cannot be a key
+})
+
 
 def format_auth_error(error: Exception) -> str:
     """Map auth failures to concise user-facing guidance."""
@@ -467,6 +476,13 @@ def format_auth_error(error: Exception) -> str:
             return generic
     if error.code == "temporarily_unavailable":
         return f"{error} Please retry in a few seconds."
+    # A credential failure names its cause in a stable token, so the text that reaches a board
+    # (``last_failure_error``) says WHICH failure it was: no key was sent
+    # (``missing_api_key``) against a key that was sent and refused (``invalid_api_key``).
+    # Without it both read as "rejected your API key" and a corrected cause is indistinguishable
+    # from a wall no retry heals.
+    if error.code in _CREDENTIAL_CAUSE_CODES:
+        return f"{error} Details: {error.code}"
     return str(error)
 
 

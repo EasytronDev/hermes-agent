@@ -29,6 +29,7 @@ from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
+from agent.credential_pool_validation import manual_pool_credential_defect, reference_credential_length
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth_oauth_grants import owned_profile_reads_root_state
 from hermes_cli.auth import (
@@ -2045,11 +2046,22 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         available: list[PooledCredential] = []
         pending_refresh: list[PooledCredential] = []
         sole_credential = self._is_sole_credential()
+        # The pool's own owner-provided credential (``env:``/``config:``/``model_config``) is the
+        # evidence a ``manual`` row is measured against: a real key for a provider whose
+        # configured key is 125 characters is not 20 characters. No reference, no judgement.
+        reference_length = reference_credential_length(self._entries)
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
             # unhydrated duplicate as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                continue
+            # A row that cannot be a credential for this provider is skipped, not selected: a
+            # store written before the write-time check existed (or by a tool that never had it)
+            # must not be able to put a 401 in front of a healthy sibling. The write-time refusal
+            # (``add_entry``) is the first line of defence; this is the one that protects a pool
+            # that was already on disk when the incident of 2026-11-10 was diagnosed.
+            if manual_pool_credential_defect(self.provider, entry, reference_length=reference_length) is not None:
                 continue
             synced = self._resync_stale_entry(entry)
             if synced is not entry:

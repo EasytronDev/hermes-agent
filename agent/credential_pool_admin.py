@@ -22,6 +22,15 @@ class CredentialNotSavedError(RuntimeError):
     """``add_entry`` wrote the pool but the store does not hold the new row."""
 
 
+class CredentialRejectedError(RuntimeError):
+    """``add_entry`` refused a row that cannot serve a request (it was never written).
+
+    Raised BEFORE the write, so the store keeps whatever it held. A credential that cannot
+    possibly work is cheaper to refuse here than to discover at the first request, where the
+    whole turn (and the card that owns it) is spent on the 401.
+    """
+
+
 class CredentialPoolAdminMixin:
     def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
         """Clear only the target's local error state, preserving sibling cooldowns."""
@@ -116,8 +125,23 @@ class CredentialPoolAdminMixin:
             _borrowed_single_use_pool_root, _next_priority, _profile_owns_pool_provider,
             write_credential_pool,
         )
+        from agent.credential_pool_validation import (
+            manual_pool_credential_defect, pool_credential_defect_reason, reference_credential_length,
+        )
         from hermes_cli import auth as auth_mod
         from hermes_cli.auth_oauth_grants import SINGLE_USE_REFRESH_POOL_PROVIDERS
+
+        # Refuse a row that cannot serve a request BEFORE it reaches the store: a credential the
+        # provider will reject with a 401 belongs in no pool, and writing it there costs the
+        # whole turn that later selects it (2026-11-10: two 20-character ``manual`` rows ahead of
+        # the real key in one profile's pool -> the first request died on a 401). The judgement is
+        # evidence-based: the pool's own owner-provided credential (``env:`` and friends) is the
+        # reference, so a provider whose key the profile does not already hold is never refused.
+        reference_length = reference_credential_length(self._entries)
+        defect = manual_pool_credential_defect(self.provider, entry, reference_length=reference_length)
+        if defect is not None:
+            raise CredentialRejectedError(
+                pool_credential_defect_reason(self.provider, entry, reference_length=reference_length))
 
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))

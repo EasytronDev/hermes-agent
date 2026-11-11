@@ -275,6 +275,30 @@ _AUTH_COPY: dict[str, str] = {
     ),
 }
 
+# The credential cause, said in one line and carrying a stable token. The auth copy above reads
+# the same for every credential failure, so a board could not tell "the key was rejected" from
+# "no key was sent" — the runtime says so itself (``hermes_cli/runtime_provider_missing_key.py``:
+# "the refusal reads 'rejected your API key' although no key was sent"). The cause token rides
+# the rendered error text, which is what the Kanban dispatcher stores in ``last_failure_error``:
+# a card whose cause was corrected can then be promoted, a quota wall cannot.
+_AUTH_CAUSE_COPY: dict[str, str] = {
+    "missing_api_key": (
+        "No API key was sent: {label} has no usable credential for this profile. "
+        "Set it in Settings → Providers, or run `hermes setup` in a terminal. "
+        "Details: missing_api_key"
+    ),
+    "invalid_api_key": (
+        "The API key sent to {label} was rejected by the provider. "
+        "Update it in Settings → Providers, or run `hermes setup` in a terminal. "
+        "Details: invalid_api_key"
+    ),
+    "pool_credential_invalid": (
+        "The credential sent to {label} came from the credential pool and cannot be a key for it "
+        "(it is malformed), so the provider rejected it. Re-add the key in Settings → Providers, "
+        "or run `hermes setup` in a terminal. Details: pool_credential_invalid"
+    ),
+}
+
 CONTENT_POLICY_NEXT_STEPS = (
     "That message has been left out of this conversation, so you're not stuck — just ask "
     "something else and you can keep going. Rewording it, removing any sensitive attachments, "
@@ -496,10 +520,14 @@ def nonretryable_copy(
 ) -> str:
     """Chat copy for a terminal non-retryable rejection (auth, model missing, TLS, generic 4xx)."""
     label = provider_label_for(provider)
+    cause = ""
     if getattr(classified, "is_auth", False):
         from agent.error_surface import auth_kind
 
         template = _AUTH_COPY[auth_kind(str(provider or ""))]
+        # A credential failure names its cause (missing / invalid / pool-row), so the board can
+        # tell a corrected cause from a wall no retry heals.
+        cause = str(getattr(classified, "failure_cause", "") or "")
     else:
         template = _NONRETRYABLE_COPY.get(classified.reason.value, _NONRETRYABLE_DEFAULT_COPY)
     prefix_hint = (
@@ -509,6 +537,8 @@ def nonretryable_copy(
     )
     body = template.format(label=label, model=model, home=display_hermes_home(), prefix_hint=prefix_hint,
                            relogin=oauth_relogin_command(provider))
+    if cause and (cause_copy := _AUTH_CAUSE_COPY.get(cause)):
+        body = cause_copy.format(label=label, home=display_hermes_home())
     return f"{body}\n\nProvider said: {summary}"
 
 
