@@ -977,9 +977,13 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
         if old is not None:
             if old['payload_digest'] != digest:
                 raise RuntimeStoreError('admission_conflict')
-            from hermes_state_runtime_workers import retired_receipt
+            from hermes_state_runtime_workers import compacted_read_receipt, retired_receipt
             if retired_receipt(old['result_json']):
                 raise RuntimeStoreError('stale_generation')  # a terminal execution's read copy
+            if compacted_read_receipt(old['result_json']):
+                # The stored payload was compacted away (it is a pure projection of durable
+                # state); re-derive it so an exact retry still returns the real result.
+                return handlers[operation](db, conn, session_id, json.loads(encoded))
             return json.loads(old['result_json'])
         if row['status'] not in ('registered', 'running'):
             raise RuntimeStoreError('stale_generation')
@@ -992,8 +996,10 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
         # closes): a read-only receipt (context, history, lineage, lifecycle) must not make a
         # client's mutation built on the pre-read revision fail revision_conflict.
         changed = conn.total_changes != changes or operation == 'execution.finish'
+        from hermes_state_runtime_workers import READ_ONLY_OPERATIONS, read_receipt_marker
+        stored = (read_receipt_marker(operation) if operation in READ_ONLY_OPERATIONS else result)
         conn.execute('INSERT INTO worker_receipts(execution_id,sequence,payload_digest,result_json) VALUES(?,?,?,?)',
-                     (execution_id, sequence, digest, json.dumps(result, ensure_ascii=True, allow_nan=False)))
+                     (execution_id, sequence, digest, json.dumps(stored, ensure_ascii=True, allow_nan=False)))
         conn.execute("UPDATE worker_executions SET last_sequence=?,status=? WHERE execution_id=?",
                      (sequence, 'terminal' if operation == 'execution.finish' else 'running', execution_id))
         if changed:

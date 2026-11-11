@@ -49,6 +49,42 @@ RETIRED_RECEIPT = {'retired': True}
 # descendant of an execution is one prefix probe away (gateway/session_worker_child.py).
 CHILD_SEPARATOR = '/child:'
 
+# Read-only worker operations: their result is a pure projection of durable state, so the
+# receipt keeps only the fact that the read happened and re-derives the payload on retry.
+# Without this, a worker that reads its session once per turn stores a full copy of the
+# session row (the resolved system prompt + the tool-name schema) in EVERY receipt for
+# the whole turn: measured 113 KB per read, 614 reads on one managed turn, 67 MB retained
+# until the execution goes terminal (and state.db grows quadratically with turn length).
+#
+# The read is re-derived from the live session row on an exact retry, so the retry contract
+# is unchanged: the same (execution, sequence, digest) still returns the same payload.
+# A MUTATION receipt is never compacted -- its result is the acknowledgement, not a
+# projection, and nothing can re-derive it.
+READ_ONLY_OPERATIONS = frozenset({
+    'compression.context',
+    'compression.history',
+    'compression.lineage',
+    'compression.watermark',
+    'compression.boundary',
+    'session.context',
+    'session.tail_role',
+    'session.row_role',
+})
+
+
+def read_receipt_marker(operation):
+    """The stored stand-in for a read receipt's payload: the operation that produced it."""
+    return {'read': True, 'op': operation}
+
+
+def compacted_read_receipt(result_json):
+    """True when *result_json* is a read receipt's marker rather than a real payload."""
+    try:
+        parsed = json.loads(result_json)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get('read') is True and 'op' in parsed
+
 
 def retire_child_executions(conn, execution_id):
     """A child never outlives the execution that reserved it: every live descendant goes terminal
