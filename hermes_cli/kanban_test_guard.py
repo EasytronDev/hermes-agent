@@ -207,7 +207,9 @@ def _is_deployment_home(home: str) -> bool:
         from hermes_state_guard import _real_platform_state_root
 
         native = _real_platform_state_root()
-    except Exception:  # pragma: no cover - the guard must never break a test
+    except (ImportError, AttributeError, OSError, RuntimeError):
+        # The guard must never break a test: if the platform root cannot be
+        # read, the published deployment home is still authoritative.
         native = None
     if native:
         try:
