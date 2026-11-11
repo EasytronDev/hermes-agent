@@ -17,6 +17,35 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
 
+# Which board a call is scoped to, and whether a machine flow is enumerating
+# boards. These live HERE, not in ``hermes_cli.kanban_db``: a test that purges
+# ``hermes_cli`` from ``sys.modules`` (the repo's
+# ``test_kanban_per_profile_cap.py`` does) would otherwise leave the board
+# resolver reading a DIFFERENT ContextVar object than the one the caller
+# set — measured: the notifier seam lost the pinned DB and the scoped
+# ``--board`` override became invisible.
+#
+# ``agent`` is not purged by that fixture, so the identity survives it.
+_KANBAN_CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "hermes_kanban_current_board_override", default=None,
+)
+# Machine flows that enumerate boards (gateway notifier / watcher / dispatcher
+# ticks) resolve board paths env-pin-first — see
+# ``hermes_cli.kanban_db.pin_first_board_resolution()``.
+_KANBAN_PIN_FIRST_BOARD_RESOLUTION: ContextVar[bool] = ContextVar(
+    "hermes_kanban_pin_first_board_resolution", default=False,
+)
+
+
+def kanban_scoped_board() -> str | None:
+    """The board a call is scoped to, if any (CLI ``--board``, dashboard API)."""
+    return _KANBAN_CURRENT_BOARD_OVERRIDE.get()
+
+
+def kanban_pin_first_resolution() -> bool:
+    """True inside a machine flow that enumerates boards."""
+    return _KANBAN_PIN_FIRST_BOARD_RESOLUTION.get()
+
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (

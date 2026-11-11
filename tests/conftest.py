@@ -167,6 +167,37 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     os.environ["HERMES_TEST_SANDBOX_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
+# ── Strip the Kanban path pins BEFORE any test module is imported ────────────
+# The per-test ``_hermetic_environment`` fixture blanks these pins (see
+# ``tests/_fixtures/env_filter.py``), but fixtures run AFTER collection — and
+# collection IMPORTS every test module. A module that resolves a kanban path
+# at import time therefore still saw the worker's pin.
+#
+# Measured incident (2026-11-10, board ``strategy-processor-sprint``): a
+# dispatched worker ran this suite with ``HERMES_KANBAN_DB`` pointing at the
+# LIVE board; the board went from 694 tasks to 1. The pin existed in the
+# environment for the whole collection phase.
+#
+# The pre-sandbox values are captured FIRST (below) so the write guard can
+# deny-list the deployment board they point at — the ``~/.hermes`` deny-list
+# alone does not cover a deployment root such as
+# ``/opt/data/kanban/boards/<board>/``.
+#
+# The strip itself lives in ``hermes_cli.kanban_test_guard`` so it can be
+# tested directly (a test that reads this file's source would only prove the
+# shape of the text, not the behavior).
+_PRE_SANDBOX_KANBAN_PINS: dict[str, str] = {}
+try:
+    from hermes_cli.kanban_test_guard import strip_path_pins as _strip_path_pins
+
+    _PRE_SANDBOX_KANBAN_PINS = _strip_path_pins(os.environ)
+except Exception:  # pragma: no cover - the strip must never break collection
+    for _kanban_pin_var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_ATTACHMENTS_ROOT",
+                             "HERMES_KANBAN_WORKSPACES_ROOT"):
+        _value = os.environ.pop(_kanban_pin_var, None)
+        if _value:
+            _PRE_SANDBOX_KANBAN_PINS[_kanban_pin_var] = _value
+
 # PYTHONPYCACHEPREFIX is a bytecode-mirror escape hatch: when set (the
 # bundled desktop app exports it as %LOCALAPPDATA%\hermes\pycache),
 # importlib/pytest write .pyc files to <prefix>/<absolute source path>
@@ -663,14 +694,81 @@ def _capture_real_kanban_root() -> Path:
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
+def _capture_pinned_kanban_roots() -> list[Path]:
+    """The DEPLOYMENT roots the inherited kanban pins pointed at.
+
+    The ``~/.hermes`` deny-list above does not cover a deployment layout:
+    ``HERMES_KANBAN_HOME`` unset means the board lives wherever the
+    deployment put it — on the 2026-11-10 incident, at
+    ``/opt/data/kanban/boards/strategy-processor-sprint/kanban.db``, which is
+    NOT under ``~/.hermes``. The write guard therefore let the test through
+    and the board was replaced.
+
+    The pins captured at conftest import time are exactly the paths that
+    pointed at that live board, so their parents become deny-listed roots.
+    """
+    roots: list[Path] = []
+    for value in _PRE_SANDBOX_KANBAN_PINS.values():
+        try:
+            path = Path(value).expanduser().resolve()
+        except (OSError, ValueError):
+            continue
+        # The pin names the DB file (or the directory it lives in); the
+        # board's own directory is what a write must not land under.
+        root = path if path.is_dir() else path.parent
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+_REAL_KANBAN_ROOTS = [_REAL_KANBAN_ROOT, *_capture_pinned_kanban_roots()]
+
+# The DEPLOYMENT's own HERMES_HOME, captured BEFORE the hermetic sandbox
+# rewired it. The kernel needs it to tell a test's home (a disposable temp
+# dir a test owns) from the deployment's home (a LIVE tree that must never
+# be claimed as a sandbox) — without it the guard treated the deployment's
+# home as disposable and every no-pin resolver escaped into it (measured:
+# all five resolvers landed under the deployment tree again).
+_REAL_HERMES_HOME = Path(os.environ.get("HERMES_HOME", "")).expanduser().resolve() \
+    if os.environ.get("HERMES_HOME", "").strip() else None
+
+
+def _publish_deployment_kanban_roots() -> None:
+    """Tell the KERNEL where this deployment keeps its boards.
+
+    Inside a test run every env-derived root is the per-test sandbox:
+    ``HERMES_HOME`` has been rewired, so ``kanban_db.kanban_home()`` resolves
+    to the sandbox and the kernel can no longer tell a live board from a
+    test-owned one. The kernel therefore needs the DEPLOYMENT's roots — the
+    ones captured above, before the sandbox rewired anything.
+
+    Published as ``HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS`` (os.pathsep-separated)
+    because an env var survives into child processes, which is where the
+    incident's damage happened.
+    """
+    roots: list[str] = []
+    for root in _REAL_KANBAN_ROOTS:
+        text = str(root)
+        if text not in roots:
+            roots.append(text)
+    os.environ["HERMES_TEST_DEPLOYMENT_KANBAN_ROOTS"] = os.pathsep.join(roots)
+    if _REAL_HERMES_HOME is not None:
+        os.environ["HERMES_TEST_DEPLOYMENT_HOME"] = str(_REAL_HERMES_HOME)
+
+
+_publish_deployment_kanban_roots()
+
+
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
-    """Fail-closed guard: refuse kanban writes that target the REAL root.
+    """Fail-closed guard: refuse kanban writes that target a REAL board root.
 
     Uses a **deny-list**: only blocks writes where the resolved DB path
-    (explicit ``db_path`` or ``kanban_db_path()``) lands under the real
-    ``~/.hermes`` captured at import time. Hermetic tests that legitimately
-    move HERMES_HOME to sibling tempdirs are unaffected.
+    (explicit ``db_path`` or ``kanban_db_path()``) lands under one of the real
+    roots captured at import time — the operator's ``~/.hermes`` AND the
+    deployment root the inherited pins pointed at (see
+    ``_capture_pinned_kanban_roots``). Hermetic tests that legitimately move
+    HERMES_HOME to sibling tempdirs are unaffected.
 
     Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
     — a ``sys.modules`` probe, not an import — so the guard never drags the
@@ -703,17 +801,19 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
                 .expanduser()
                 .resolve()
             )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
+        for _root in _REAL_KANBAN_ROOTS:
+            try:
+                resolved.relative_to(_root)
+            except ValueError:
+                # Resolved path is NOT under this real root — safe to write.
+                continue
+            raise RuntimeError(
+                f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+                f"which is under the REAL kanban root ({_root}). "
+                f"Hermetic isolation has been bypassed — refusing to write "
+                f"to a live board. See #69283."
+            )
+        return _orig_connect(db_path, *args, **kwargs)
 
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
 
@@ -1087,6 +1187,30 @@ def _relocate_basetemp_outside_operator_home(config) -> None:
     config._hermes_relocated_basetemp = safe
 
 
+def _export_pytest_basetemp(config) -> None:
+    """Publish pytest's basetemp so the kernel's test guard knows where the
+    test sandbox is.
+
+    The basetemp is where pytest's ``tmp_path`` lands. The kernel's kanban
+    guard (:mod:`hermes_cli.kanban_test_guard`) needs to tell a test-owned
+    path from a live board, and the basetemp is the authoritative answer —
+    more reliable than guessing from TMPDIR, whose layout varies (this host
+    redirects TMPDIR into the profile scratch, and the conftest relocates the
+    basetemp out of the operator's home into a per-run directory).
+
+    The variable is OURS (not pytest's ``PYTEST_*``), so it survives a child
+    that scrubs pytest's own markers, and it is inherited by default.
+    """
+    basetemp = getattr(config, "option", None)
+    root = getattr(basetemp, "basetemp", None) if basetemp is not None else None
+    if not root:
+        factory = getattr(config, "_tmp_path_factory", None)
+        root = getattr(factory, "_given_basetemp", None) if factory is not None else None
+    if not root:
+        return
+    os.environ["HERMES_TEST_PYTEST_BASETEMP"] = str(root)
+
+
 def _pytest_disk_temp_root(native: Path) -> Path:
     """The root for relocated basetemps: the disk-backed runner root when the host has
     one (``scripts/run_tests_parallel.py::_runner_scratch_root``), else a plain (not
@@ -1206,6 +1330,7 @@ def pytest_unconfigure(config):
 def pytest_configure(config):
     """Register markers used by hermetic conftest."""
     _relocate_basetemp_outside_operator_home(config)
+    _export_pytest_basetemp(config)
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "

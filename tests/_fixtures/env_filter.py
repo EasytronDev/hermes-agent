@@ -185,10 +185,18 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.
+    #
+    # The 2026-11-10 incident (board ``strategy-processor-sprint``: 694 tasks
+    # -> 1) was a dispatched worker running this suite with
+    # ``HERMES_KANBAN_DB`` still set; the fixture wrote into the LIVE board.
+    # ``HERMES_KANBAN_ATTACHMENTS_ROOT`` was missing from this list, so it
+    # leaked into EVERY test (not just the collection window) and pointed
+    # attachments at the deployment's attachment tree.
     "HERMES_KANBAN_DB",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_HOME",
     "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
     "HERMES_KANBAN_LOGS_ROOT",
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_WORKSPACE",
