@@ -392,3 +392,39 @@ def test_a_worker_environment_cannot_reach_a_live_board_through_a_child_process(
     assert resolved != str(live_board), (
         f"a child process resolved the live board {live_board}"
     )
+
+
+def test_the_incident_fixtures_own_env_cannot_resolve_the_pinned_board(monkeypatch):
+    """The EXACT env choreography of the fixture that caused the wipe.
+
+    ``tests/hermes_cli/test_kanban_review_surfaces.py::review_worker`` sets
+    ``HERMES_HOME`` to a tmp dir, patches ``Path.home``, sets
+    ``HERMES_PROFILE='builder'``, deletes ``HERMES_DELEGATED_CHILD_CONTEXT``
+    — and never touches ``HERMES_KANBAN_DB``. The pin therefore survives and
+    decides where the "Review tool contract" card lands.
+
+    On the base that resolution is the PINNED FILE. This test pins the
+    branch's behavior: the same env resolves into the sandbox.
+    """
+    live_board = Path(tempfile.mkdtemp(prefix="fixture-env-")) / "kanban.db"
+    try:
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
+        monkeypatch.setenv("HERMES_HOME", str(live_board.parent / ".hermes"))
+        monkeypatch.setenv("HERMES_PROFILE", "builder")
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x.py::review_worker (call)")
+
+        resolved = kb.kanban_db_path()
+
+        assert resolved != live_board, (
+            f"the fixture's env resolved the pinned board {live_board} — "
+            f"the card would land in the live board"
+        )
+        assert ktg.pin_points_into_sandbox(str(resolved)), (
+            f"the fallback {resolved} is not inside a disposable sandbox"
+        )
+    finally:
+        import shutil
+
+        shutil.rmtree(live_board.parent, ignore_errors=True)
