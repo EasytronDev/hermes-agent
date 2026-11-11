@@ -1226,9 +1226,9 @@ def _owner_credential_reference_length(rows: Any) -> int:
             if not env_var:
                 continue
             secret = get_env_prefer_dotenv(env_var)
-            if isinstance(secret, str) and len(secret) > longest:
-                longest = len(secret)
-    except Exception:  # noqa: BLE001
+            if isinstance(secret, str):
+                longest = max(longest, len(secret))
+    except Exception:  # health: allow BLE001 -- the environment read is best-effort: any failure leaves the store's own measurement in place
         # The environment is not readable here; the store's own measurement still holds.
         return persisted
     return longest
