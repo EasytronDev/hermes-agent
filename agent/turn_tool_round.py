@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
@@ -24,6 +25,32 @@ _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session
 # Rounds whose visible line is the turn's reply if the follow-up is empty (no empty-response nudge):
 # housekeeping, and setup_beat, whose card already blocked for the user's answer.
 _LINE_IS_REPLY_TOOLS = _HOUSEKEEPING_TOOLS | {"setup_beat"}
+
+
+def _kanban_guardrail_halt_nudge(agent: Any, messages: Any) -> Optional[str]:
+    """The follow-up turn a guardrail-halted kanban worker gets to close its card.
+
+    ``None`` for a normal (interactive) session, for a worker that already made a terminal
+    board call, and once the bounded budget is spent — the dispatcher then books the run
+    honestly instead of looping forever. The guard is policy-only: it re-enters the turn
+    loop with an instruction, it never writes to the board itself.
+
+    The budget counter lives on the agent as ``_kanban_guardrail_halt_nudges``: it is
+    RUN-scoped (NOT reset per turn), so a worker cannot spend one nudge per turn forever.
+    It is read with ``getattr(..., 0)`` and created on first write, so it needs no entry
+    in ``agent.agent_init._CONTROL_STATE`` (which is over its line cap and may only
+    shrink).
+    """
+    try:
+        from agent.kanban_stop import build_guardrail_halt_nudge
+
+        return build_guardrail_halt_nudge(
+            messages=messages,
+            attempts=getattr(agent, "_kanban_guardrail_halt_nudges", 0),
+        )
+    except Exception:
+        logger.debug("kanban guardrail-halt nudge check failed", exc_info=True)
+        return None
 
 
 @dataclass
@@ -195,6 +222,36 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        # A kanban worker must end the turn with a terminal BOARD call. The guardrail halt
+        # happens mid-tool-round, so it never reaches the turn-end stop gates
+        # (``agent/turn_stop_gates.py``) where the kanban stop nudge lives: breaking here
+        # left the worker asking the owner for `continue` (nobody watches a headless card)
+        # and exiting rc=0 with no terminal call — the dispatcher's ``protocol_violation``.
+        # Give the worker one bounded follow-up turn to actually close the card.
+        _kanban_nudge = _kanban_guardrail_halt_nudge(agent, messages)
+        if _kanban_nudge:
+            agent._kanban_guardrail_halt_nudges = (
+                getattr(agent, "_kanban_guardrail_halt_nudges", 0) + 1
+            )
+            append_message(messages, {
+                "role": "user",
+                "content": _kanban_nudge,
+                "_kanban_guardrail_halt_synthetic": True,
+            })
+            agent._session_messages = messages
+            agent._emit_diagnostic_status(
+                "⚠️ Tool guardrail halted a kanban worker — nudging it to close the card "
+                "(kanban_complete / kanban_request_review / kanban_block)"
+            )
+            logger.info(
+                "kanban guardrail-halt nudge issued (attempt %d) task=%s code=%s",
+                agent._kanban_guardrail_halt_nudges,
+                os.environ.get("HERMES_KANBAN_TASK", ""),
+                decision.code,
+            )
+            # Re-enter the turn loop with the nudge in context: the worker now closes
+            # the card instead of answering a question nobody asked.
+            return _verdict("continue")
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
