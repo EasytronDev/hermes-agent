@@ -1184,6 +1184,56 @@ def classify_api_error(
     return classified
 
 
+def _owner_credential_reference_length(rows: Any) -> int:
+    """The length of the pool's owner-provided credential, read from the LIVE source.
+
+    ``reference_credential_length`` measures the owner rows as they sit in the store. For an
+    ``env:`` row that number is 0 in every real profile: the source is BORROWED
+    (``agent.credential_persistence.is_borrowed_credential_source``), so the disk boundary
+    strips the secret and leaves only ``secret_fingerprint`` (measured: 11 owner rows across
+    9 profiles, every one of them without ``access_token``). The pool hydrates that row from
+    the profile's ``.env`` when it loads, so the credential the runtime actually compares
+    against is the one in the environment — not the one on disk.
+
+    Judging the malformed row against a 0-length reference cannot happen (``_MIN_REFERENCE_LENGTH``
+    is 16), so the defect was invisible and the board saw ``invalid_api_key`` instead of
+    ``pool_credential_invalid``.
+
+    The row's own ``source`` names the env var (``env:MINIMAX_API_KEY``) and survives the
+    sanitizer, so the live value is read the way the pool reads it — ``get_env_prefer_dotenv``,
+    which prefers the profile's ``.env`` over the ambient environment. The LONGEST owner
+    credential wins, which is exactly what ``reference_credential_length`` means, so this
+    returns the same number the pool would.
+
+    Reading the environment has no side effect: no ``auth.json`` is written, ``load_pool()`` is
+    never called (it persists), and a failure here leaves the reference at whatever the store
+    itself carries — the cold behaviour, unchanged.
+    """
+    from agent.credential_pool_validation import reference_credential_length
+
+    persisted = reference_credential_length(rows)
+    longest = persisted
+    try:
+        from agent.credential_pool import get_env_prefer_dotenv
+
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or "")
+            if not source.startswith("env:"):
+                continue
+            env_var = source.split(":", 1)[1].strip()
+            if not env_var:
+                continue
+            secret = get_env_prefer_dotenv(env_var)
+            if isinstance(secret, str):
+                longest = max(longest, len(secret))
+    except Exception:  # health: allow BLE001 -- the environment read is best-effort: any failure leaves the store's own measurement in place
+        # The environment is not readable here; the store's own measurement still holds.
+        return persisted
+    return longest
+
+
 def _credential_failure_cause(provider: str, api_key: Any) -> str:
     """Which credential failure this is: a defective pool row, or the key itself.
 
@@ -1198,6 +1248,10 @@ def _credential_failure_cause(provider: str, api_key: Any) -> str:
     written by a tool that never had it (2026-11-10: two 20-character ``manual`` rows
     ahead of the real key in one profile's pool, and the board could not tell "the pool
     holds a malformed row" from "the key is wrong").
+
+    The comparison needs the pool's owner-provided credential, and on disk that credential
+    has no secret (it is borrowed and sanitized), so it is read from the live source the
+    pool itself hydrates it from — see :func:`_owner_credential_reference_length`.
     """
     if not provider or not api_key:
         return FAILURE_CAUSE_INVALID_API_KEY
@@ -1210,7 +1264,7 @@ def _credential_failure_cause(provider: str, api_key: Any) -> str:
         rows = read_credential_pool(provider)
         if not rows:
             return FAILURE_CAUSE_INVALID_API_KEY
-        reference = reference_credential_length(rows)
+        reference = _owner_credential_reference_length(rows)
         for row in rows:
             secret = row.get("access_token") if isinstance(row, dict) else None
             if not isinstance(secret, str) or not secret or secret != api_key:
