@@ -13,17 +13,38 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             # "status" overrides the HTTP status of a given endpoint family; "body" the
+             # JSON payload GitHub would return with it.
+             "status": {}, "body": {}}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state["requests"].append(self.path)
             sha = state["head"]
+            # A scripted refusal for this endpoint family (e.g. the private-repo
+            # free-plan 403 on /rules/branches) short-circuits the normal body.
+            family = ("rules" if "/rules/branches/" in self.path else
+                      "check-runs" if "/check-runs" in self.path else
+                      "statuses" if "/statuses" in self.path else
+                      "pulls" if "/pulls/" in self.path else
+                      "graphql" if self.path == "/graphql" else "other")
+            refusal = state["status"].get(family)
+            if refusal:
+                code = refusal
+                message = state["body"].get(family, {"rules": "Upgrade to GitHub Pro or make this repository public to enable this feature."}.get(family, "Not Found"))
+                payload = json.dumps({"message": message, "status": str(code)}).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "headRefOid": sha, "baseRefName": "main", "state": state.get("pr_state", "OPEN"),
+                    "baseRef": {"branchProtectionRule": state.get("protection", {"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]})}}}}}
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -43,7 +64,9 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main"},
+                         "state": state.get("pull_state", "open"),
+                         "merged": state.get("pull_merged", False)}
             else:
                 self.send_error(404)
                 return
@@ -60,9 +83,16 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    # Real `gh api` exits non-zero and prints "gh: <message> (HTTP <code>)" on stderr
+    # for a refused read; the gate parses that status code out of stderr.
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error,json\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n"
+                  "    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    detail=json.loads(e.read().decode())\n"
+                  "    print('gh: '+detail.get('message','error')+' (HTTP %d)'%e.code, file=sys.stderr)\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +260,136 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- private repository on the free plan: the rulesets read is plan-gated ---
+
+PLAN_403 = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+
+
+def _receipt(conn, tid):
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC",
+        (tid,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+@pytest.mark.platforms("linux")
+def test_free_plan_private_repo_is_not_an_auth_failure(github):
+    """The private-repo free-plan 403 on /rules/branches is a PLAN limitation, not
+    an identity failure: the gate must read the branch-protection rule GraphQL
+    already returned instead of classifying the card `auth` (unfixable by the
+    operator, retry-hostile, and blocking every code card with a PR contract).
+
+    The login demonstrably read the repository — the PR came back over GraphQL —
+    and GitHub answers 404 (not 403) for a repository the login cannot see, so a
+    403 here can only be the paid-plan gate."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    # The real repository carries no branch protection rule at all.
+    github["protection"] = None
+    with connect() as conn:
+        tid = kb.create_task(conn, title="free-plan-private", completion_contract="acme/repo")
+        kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = _receipt(conn, tid)
+    assert receipt["classification"] != "auth", receipt["detail"]
+    # Zero required checks: the gate reports "missing", NOT "auth" — the card is
+    # no longer stuck on an unfixable credential error.
+    assert receipt["classification"] == "missing"
+    assert receipt["ok"] is False
+    assert "rulesets_unavailable" in receipt
+    assert "403" in receipt["rulesets_unavailable"]
+    # The refusal is recorded as a plan limitation, never as a credential hint.
+    assert "credential" not in receipt["detail"].lower()
+
+
+@pytest.mark.platforms("linux")
+def test_free_plan_repo_still_enforces_the_branch_protection_required_checks(github):
+    """Degrading the rulesets read must NOT make the gate permissive: a required
+    check from the branch protection rule that did not pass still refuses the
+    completion, and a passing one still accepts it."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    with connect() as conn:
+        for conclusion, accepted in (("success", True), ("failure", False), ("pending", False)):
+            github["conclusion"] = conclusion
+            tid = kb.create_task(conn, title=f"free-plan-{conclusion}", completion_contract="acme/repo")
+            assert kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"}) is accepted
+            receipt = _receipt(conn, tid)
+            assert receipt["classification"] == ("success" if accepted else conclusion)
+            assert receipt["required"] == [{"context": "required", "app_id": 1}]
+            assert receipt["checks"][0]["name"] == "required"
+
+
+@pytest.mark.platforms("linux")
+def test_rulesets_read_401_and_404_still_raise_auth(github):
+    """Only the paid-plan 403 degrades. A 401/404 on the rulesets read is a real
+    access failure and must keep raising `auth` — the gate may not swallow it."""
+    for code in (401, 404):
+        github["status"]["rules"] = code
+        github["body"]["rules"] = "Not Found" if code == 404 else "Bad credentials"
+        with connect() as conn:
+            tid = kb.create_task(conn, title=f"denied-{code}", completion_contract="acme/repo")
+            kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            receipt = _receipt(conn, tid)
+        assert receipt["classification"] == "auth", (code, receipt)
+        assert "rulesets_unavailable" not in receipt
+
+
+@pytest.mark.platforms("linux")
+def test_a_403_outside_the_rulesets_read_still_raises_auth(github):
+    """The degradation is scoped to the rulesets endpoint: a 403 from any other
+    read (here the check-runs read) is still an access failure and must keep
+    raising `auth`. The gate may not generalise "403 means plan limit"."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    github["status"]["check-runs"] = 403
+    github["body"]["check-runs"] = "Resource not accessible by personal access token"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="check-runs-denied", completion_contract="acme/repo")
+        kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = _receipt(conn, tid)
+    # The rulesets 403 was degraded (and recorded), but the check-runs 403 was
+    # NOT: the card still fails as an identity problem.
+    assert receipt["classification"] == "auth", receipt
+    assert "rulesets_unavailable" in receipt
+
+
+@pytest.mark.platforms("linux")
+def test_merged_pr_is_accepted_under_the_free_plan(github):
+    """A MERGED PR is accepted: the gate accepts `pr.state in {OPEN, MERGED}`, and
+    the free-plan 403 on the rulesets read must not disturb that."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    github["pr_state"] = "MERGED"
+    github["pull_state"] = "closed"
+    github["pull_merged"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="merged-free-plan", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = _receipt(conn, tid)
+    assert receipt["classification"] == "success", receipt
+    assert receipt["ok"] is True
+    assert kb.get_task(conn, tid).status == "done"
+
+
+@pytest.mark.platforms("linux")
+def test_free_plan_repo_with_no_required_checks_is_reported_not_accepted(github):
+    """The real repository has no branch protection rule and no rulesets, so there
+    is genuinely nothing to require. The gate must say so plainly instead of
+    raising an auth error — a card that declares a PR contract on a repository
+    with zero required checks is reported as `missing` with the reason."""
+    github["status"]["rules"] = 403
+    github["body"]["rules"] = PLAN_403
+    github["protection"] = None
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no-required", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = _receipt(conn, tid)
+        assert kb.get_task(conn, tid).status != "done"
+    assert receipt["classification"] == "missing"
+    assert receipt["required"] == []
+    assert "No repository-required checks" in receipt["detail"]
