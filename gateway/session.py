@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -695,6 +696,32 @@ def _canonical_participant(source: SessionSource) -> Optional[str]:
     if participant_id and source.platform == Platform.WHATSAPP:
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
     return participant_id
+
+
+_SESSION_KEY_CHAT_ID_RE = re.compile(
+    r"^agent:(?:main|main~|[a-z0-9][a-z0-9_-]{0,63}):([^:]+):([^:]+):(.+)$"
+)
+
+
+def bare_chat_id(chat_id: str) -> str:
+    """Return the bare chat id of ``chat_id``, unwrapping a full session key if needed.
+
+    A session key (``agent:{ns}:{platform}:{chat_type}:{chat_id}[:{extra}...]``) is NOT a chat id.
+    Feeding one to :func:`build_session_key` prefixes it a second time, and the resulting
+    double-prefixed key parses back to the literal ``"agent"`` as its chat id — which is not a
+    session id, so every receipt lookup for it misses.
+
+    Some persisted rows (notably ``kanban_notify_subs.chat_id``) store the full session key in
+    the chat_id column. Unwrap those back to the chat id they encode so the key round-trips.
+    Any value that is not shaped like a session key is returned unchanged.
+    """
+    text = str(chat_id or "").strip()
+    if not text:
+        return text
+    match = _SESSION_KEY_CHAT_ID_RE.match(text)
+    if not match:
+        return text
+    return match.group(3)
 
 
 def build_session_key(
