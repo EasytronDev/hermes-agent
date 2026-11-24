@@ -702,8 +702,8 @@ class _KanbanNotification:
         if not served_profile:
             return contextlib.nullcontext()
         from gateway.run import _async_profile_runtime_scope
-        from gateway.session import SessionSource
-        source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=served_profile)
+        from gateway.session import SessionSource, bare_chat_id
+        source = SessionSource(platform=self.plat, chat_id=bare_chat_id(self.sub["chat_id"]), profile=served_profile)
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
     async def wake(self) -> None:
@@ -722,7 +722,7 @@ class _KanbanNotification:
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
             return
-        from gateway.session import SessionSource
+        from gateway.session import SessionSource, bare_chat_id
         # Rebuild the creator's real session scope from the persisted chat_type:
         # build_session_key() keys DMs differently from group/thread, so a
         # hardcoded "group" mis-routed DM/thread creators into a fresh session.
@@ -734,8 +734,13 @@ class _KanbanNotification:
         # ever degrades to a fresh session, never an exception.
         _delivery_meta = sub.get("delivery_metadata") or {}
         _chat_type = str(sub.get("chat_type") or _delivery_meta.get("chat_type") or "").strip()
+        # Some rows store the creator's FULL SESSION KEY in the chat_id column. build_session_key()
+        # would prefix it a second time and the double-prefixed key parses back to the literal
+        # "agent" as its chat id — not a session id, so the local receipt lookup misses and the
+        # restore logs "storage_unavailable" on every tick, for every pending subscription.
+        _chat_id = bare_chat_id(sub["chat_id"])
         _source = SessionSource(
-            platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
+            platform=self.plat, chat_id=_chat_id, chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
             profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
